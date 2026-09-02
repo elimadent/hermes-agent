@@ -25,6 +25,7 @@ import os
 import queue
 import random
 import re
+import secrets
 import sqlite3
 import struct
 import sys
@@ -11912,12 +11913,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 turn_lease_holder=turn_lease_holder,
                 turn_lease_ttl_seconds=turn_lease_ttl_seconds,
             )
+            logical_id, history_seq = self._allocate_message_identity(
+                conn, session_id, None, None
+            )
             cursor = conn.execute(
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
-                   codex_message_items, platform_message_id, observed, _compressed_summary, active, api_content, display_kind, display_metadata)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   codex_message_items, platform_message_id, observed, _compressed_summary, active, api_content, display_kind, display_metadata,
+                   logical_id, history_seq)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     role,
@@ -11941,6 +11946,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     _scrub_surrogates(api_content) if isinstance(api_content, str) else None,
                     _scrub_surrogates(display_kind) if isinstance(display_kind, str) else None,
                     display_metadata_json,
+                    logical_id,
+                    history_seq,
                 ),
             )
             msg_id = cursor.lastrowid
@@ -12304,6 +12311,47 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         return row[0] if row else None
 
+    def _logical_identity_payload_key(self, row) -> tuple:
+        """Canonical immutable payload, excluding physical-copy metadata."""
+        display_key = self._display_dedupe_key(row)
+        return display_key[:2] + display_key[3:]
+
+    def _allocate_message_identity(
+        self,
+        conn,
+        session_id: str,
+        logical_id: Optional[str],
+        history_seq: Optional[int],
+        payload_key: Optional[tuple] = None,
+    ) -> tuple[str, int]:
+        """Preserve a verified same-session identity or atomically mint one."""
+        if isinstance(logical_id, str) and logical_id and isinstance(history_seq, int):
+            existing = conn.execute(
+                "SELECT * FROM messages WHERE logical_id = ? LIMIT 1",
+                (logical_id,),
+            ).fetchone()
+            if (
+                existing is not None
+                and existing["history_seq"] is not None
+                and int(existing["history_seq"]) == history_seq
+            ):
+                if payload_key is not None and self._logical_identity_payload_key(existing) != payload_key:
+                    raise ValueError("logical identity payload mismatch")
+                return logical_id, history_seq
+
+        row = conn.execute(
+            "SELECT MAX(COALESCE(history_seq_counter, 0), "
+            "COALESCE((SELECT MAX(history_seq) FROM messages WHERE session_id = ?), 0)) "
+            "FROM sessions WHERE id = ?",
+            (session_id, session_id),
+        ).fetchone()
+        next_seq = int(row[0] or 0) + 1
+        conn.execute(
+            "UPDATE sessions SET history_seq_counter = ? WHERE id = ?",
+            (next_seq, session_id),
+        )
+        return uuid.uuid4().hex, next_seq
+
     def _insert_message_rows(self, conn, session_id: str, messages: List[Dict[str, Any]]) -> tuple[int, int]:
         """Insert *messages* as fresh active rows for *session_id*.
 
@@ -12356,13 +12404,40 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
 
             api_content = msg.get("api_content")
+            stored_content = self._encode_content(msg.get("content"))
+            identity_payload_key = self._logical_identity_payload_key(
+                {
+                    "role": role,
+                    "content": stored_content,
+                    "timestamp": message_timestamp,
+                    "tool_call_id": msg.get("tool_call_id"),
+                    "tool_calls": tool_calls_json,
+                    "tool_name": _scrub_surrogates(msg.get("tool_name")),
+                    "display_kind": (
+                        _scrub_surrogates(msg.get("display_kind"))
+                        if isinstance(msg.get("display_kind"), str)
+                        else None
+                    ),
+                    "display_metadata": self._encode_display_metadata(
+                        msg.get("display_metadata")
+                    ),
+                }
+            )
+            logical_id, history_seq = self._allocate_message_identity(
+                conn,
+                session_id,
+                msg.get("logical_id"),
+                msg.get("history_seq"),
+                identity_payload_key,
+            )
 
             cur = conn.execute(
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
-                   codex_message_items, platform_message_id, observed, _compressed_summary, active, api_content, display_kind, display_metadata)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   codex_message_items, platform_message_id, observed, _compressed_summary, active, api_content, display_kind, display_metadata,
+                   logical_id, history_seq)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     role,
@@ -12386,10 +12461,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     _scrub_surrogates(api_content) if isinstance(api_content, str) else None,
                     _scrub_surrogates(msg.get("display_kind")) if isinstance(msg.get("display_kind"), str) else None,
                     self._encode_display_metadata(msg.get("display_metadata")),
+                    logical_id,
+                    history_seq,
                 ),
             )
             if isinstance(msg, dict) and cur.lastrowid is not None:
                 msg["_row_id"] = cur.lastrowid
+                msg["logical_id"] = logical_id
+                msg["history_seq"] = history_seq
             inserted += 1
             if tool_calls is not None:
                 tool_calls_total += (
@@ -12468,6 +12547,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     and session["end_reason"] == "compression"
                 ):
                     raise CompressionSessionClosedError(session_id)
+            old_delete_max_id = None
             if archive_dropped:
                 # Content-preserving UPDATE: the rows keep their FTS entries
                 # (the messages_fts triggers fire on INSERT / DELETE / UPDATE
@@ -12480,10 +12560,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     (session_id,),
                 )
             else:
-                conn.execute(
-                    f"DELETE FROM messages WHERE session_id = ?{active_clause}",
+                old_row = conn.execute(
+                    f"SELECT MAX(id) FROM messages WHERE session_id = ?{active_clause}",
                     (session_id,),
-                )
+                ).fetchone()
+                old_delete_max_id = old_row[0] if old_row else None
             conn.execute(
                 "UPDATE sessions SET message_count = 0, tool_call_count = 0 WHERE id = ?",
                 (session_id,),
@@ -12491,6 +12572,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             total_messages, total_tool_calls = self._insert_message_rows(
                 conn, session_id, messages
             )
+            if old_delete_max_id is not None:
+                conn.execute(
+                    f"DELETE FROM messages WHERE session_id = ?{active_clause} AND id <= ?",
+                    (session_id, old_delete_max_id),
+                )
             conn.execute(
                 "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
                 (total_messages, total_tool_calls, session_id),
@@ -12784,6 +12870,307 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         return self._execute_write(_do)
 
+    # Dedupe key for display reads. Compaction epochs copy the protected tail
+    # into each new generation, so the same logical message can exist as
+    # several rows with different active flags and ids. Tool fields
+    # participate: compaction copies them verbatim, so identical tool messages
+    # across generations still collapse, while distinct tool calls that happen
+    # to share role/content/timestamp are never merged.
+    def _display_dedupe_key(self, row) -> tuple:
+        # A user turn that carries a compaction handoff is stored with the
+        # handoff attached, but the live view is what the display shows. Two
+        # generations of the same logical turn therefore differ byte-wise in
+        # ``content`` while being the same message, so the dedupe key must be
+        # built from the live view, not the raw row.
+        dedupe_content = row["content"]
+        if row["role"] == "user":
+            from agent.context_compressor import split_user_originated_turn
+
+            candidate = {
+                "role": "user",
+                "content": self._decode_content(row["content"]),
+                "display_kind": row["display_kind"],
+                "display_metadata": self._decode_display_metadata(
+                    row["display_metadata"]
+                ),
+            }
+            handoff, live_view = split_user_originated_turn(candidate)
+            if handoff is not None and live_view is not None:
+                dedupe_content = self._encode_content(live_view.get("content"))
+        return (
+            row["role"],
+            dedupe_content,
+            row["timestamp"],
+            row["tool_call_id"],
+            row["tool_calls"],
+            row["tool_name"],
+        )
+
+    def history_cursor_identity(self) -> Dict[str, str]:
+        """Return stable per-database cursor identity and signing material."""
+        def _do(conn):
+            values: Dict[str, str] = {}
+            for key, size in (("history_cursor_store_uuid", 16), ("history_cursor_hmac_key", 32)):
+                row = conn.execute(
+                    "SELECT value FROM state_meta WHERE key = ?", (key,)
+                ).fetchone()
+                value = row["value"] if row else None
+                if not value:
+                    value = secrets.token_hex(size)
+                    conn.execute(
+                        "INSERT OR REPLACE INTO state_meta(key, value) VALUES (?, ?)",
+                        (key, value),
+                    )
+                values[key] = value
+            return {
+                "store_uuid": values["history_cursor_store_uuid"],
+                "signing_key": values["history_cursor_hmac_key"],
+            }
+
+        return self._execute_write(_do)
+
+    def ensure_history_cursor_capability(self, session_id: str) -> Dict[str, Any]:
+        """Promote one exact legacy display projection, or validate native identities."""
+        def _do(conn):
+            session = conn.execute(
+                "SELECT history_cursor_epoch FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if session is None:
+                return {"status": "unavailable", "reason": "missing_session"}
+
+            rows = conn.execute(
+                "SELECT * FROM messages WHERE session_id = ? "
+                "AND (active = 1 OR compacted = 1) ORDER BY id ASC LIMIT ?",
+                (session_id, self._DISPLAY_RAW_ROW_BUDGET + 1),
+            ).fetchall()
+            if len(rows) > self._DISPLAY_RAW_ROW_BUDGET:
+                return {"status": "unavailable", "reason": "pagination_work_limit"}
+
+            missing_rows = [row for row in rows if row["logical_id"] is None or row["history_seq"] is None]
+            identified_rows = [row for row in rows if row["logical_id"] is not None or row["history_seq"] is not None]
+            if missing_rows and identified_rows:
+                return {"status": "unavailable", "reason": "mixed_identity_projection"}
+            if missing_rows and any(row["compacted"] for row in rows):
+                return {"status": "unavailable", "reason": "legacy_compacted_history"}
+
+            if missing_rows:
+                for seq, row in enumerate(rows, 1):
+                    conn.execute(
+                        "UPDATE messages SET logical_id = ?, history_seq = ? WHERE id = ?",
+                        (uuid.uuid4().hex, seq, row["id"]),
+                    )
+                conn.execute(
+                    "UPDATE sessions SET history_seq_counter = ? WHERE id = ?",
+                    (len(rows), session_id),
+                )
+            else:
+                mapping: Dict[str, tuple] = {}
+                sequence_owners: Dict[int, str] = {}
+                for row in rows:
+                    logical_id = row["logical_id"]
+                    history_seq = row["history_seq"]
+                    if not logical_id or not isinstance(history_seq, int) or history_seq <= 0:
+                        return {"status": "unavailable", "reason": "ambiguous_identity_projection"}
+                    identity = (history_seq, self._display_dedupe_key(row))
+                    if logical_id in mapping and mapping[logical_id] != identity:
+                        return {"status": "unavailable", "reason": "ambiguous_identity_projection"}
+                    owner = sequence_owners.get(history_seq)
+                    if owner is not None and owner != logical_id:
+                        return {"status": "unavailable", "reason": "ambiguous_identity_projection"}
+                    mapping[logical_id] = identity
+                    sequence_owners[history_seq] = logical_id
+
+            epoch = session["history_cursor_epoch"] or uuid.uuid4().hex
+            conn.execute(
+                "UPDATE sessions SET history_cursor_epoch = ? WHERE id = ?",
+                (epoch, session_id),
+            )
+            return {"status": "available", "cursor_epoch": epoch}
+
+        return self._execute_write(_do)
+
+    def get_history_cursor_page(
+        self, session_id: str, *, before_seq: Optional[int], limit: int
+    ) -> Dict[str, Any]:
+        """Read one bounded, deduped logical page in chronological order."""
+        if limit < 1 or limit > 500:
+            raise ValueError("cursor limit must be between 1 and 500")
+        boundary = before_seq if before_seq is not None else (1 << 63) - 1
+        with self._read_ctx() as conn:
+            rows = conn.execute(
+                "SELECT * FROM messages WHERE session_id = ? "
+                "AND (active = 1 OR compacted = 1) "
+                "AND logical_id IS NOT NULL AND history_seq < ? "
+                "ORDER BY history_seq DESC, id DESC LIMIT ?",
+                (session_id, boundary, self._DISPLAY_RAW_ROW_BUDGET + 1),
+            ).fetchall()
+        if len(rows) > self._DISPLAY_RAW_ROW_BUDGET:
+            raise ValueError("compacted display read exceeded raw-row work budget")
+
+        winners: Dict[str, Any] = {}
+        sequences: Dict[str, int] = {}
+        for row in rows:
+            logical_id = row["logical_id"]
+            history_seq = int(row["history_seq"])
+            if logical_id in sequences and sequences[logical_id] != history_seq:
+                raise ValueError("ambiguous logical history")
+            sequences[logical_id] = history_seq
+            current = winners.get(logical_id)
+            if current is None or (row["active"], row["id"]) > (
+                current["active"], current["id"]
+            ):
+                winners[logical_id] = row
+
+        newest = sorted(winners.values(), key=lambda row: row["history_seq"], reverse=True)
+        selected = newest[:limit]
+        has_more = len(newest) > limit
+        selected.reverse()
+        messages = []
+        for row in selected:
+            msg = dict(row)
+            msg["content"] = self._decode_content(msg.get("content"))
+            if msg.get("tool_calls"):
+                msg["tool_calls"] = json.loads(msg["tool_calls"])
+            if msg.get("display_metadata") is not None:
+                msg["display_metadata"] = self._decode_display_metadata(msg["display_metadata"])
+            messages.append(msg)
+        return {
+            "messages": messages,
+            "has_more": has_more,
+            "before_seq": int(selected[0]["history_seq"]) if has_more and selected else None,
+        }
+
+    # How many rows the bounded tail scan reads on its first pass, relative to
+    # the page it must fill. Compaction duplicates cluster, so a small multiple
+    # of the page almost always yields a full page in one pass; the scan widens
+    # geometrically when it doesn't.
+    _DISPLAY_TAIL_SCAN_FACTOR = 8
+    _DISPLAY_TAIL_SCAN_MIN = 1024
+    # Bounded display reads may inspect at most this many raw generations.
+    # The newest-tail fast path normally stops far earlier; oldest-page reads
+    # stream in small batches. Both fail closed beyond the same finite budget.
+    _DISPLAY_RAW_ROW_BUDGET = 100_000
+    _DISPLAY_STREAM_BATCH_SIZE = 256
+
+    def _deduped_display_rows(
+        self,
+        session_id: str,
+        active_clause: str,
+        limit: Optional[int],
+        offset: int,
+        latest: bool,
+    ) -> list:
+        """Deduplicated display history for a session, paged.
+
+        Each logical message is surfaced exactly once, preferring the live row
+        and then the newest generation (max ``(active, id)`` within a dedupe
+        group), ordered by the surviving row's id.
+
+        The naive implementation reads the session's whole display set and
+        dedupes in Python. That is correct but pathological on compacted
+        sessions: a 131-message session can hold ~17k rows, so opening it cost
+        seconds of cold random I/O to return a 120-row tail page.
+
+        When the caller wants a bounded NEWEST page (``latest=True`` with a
+        ``limit``) — which is every desktop transcript hydration and every
+        "Show earlier" backfill — walk backwards from the newest id instead
+        and stop as soon as the page is filled.
+
+        Stopping early is only sound when the window already holds every row
+        that could win a dedupe group it touches. Taking the highest id per
+        group is NOT enough: the winner rule prefers a live row. Early return is
+        therefore allowed only when every candidate is already a live winner;
+        otherwise the window widens geometrically until exhaustion. The widening
+        is capped by a raw-row budget so adversarial layouts fail closed.
+
+        Bounded OLDEST pages stream in ascending order rather than calling
+        ``fetchall()``. Exact dedupe and offset semantics still require seeing
+        every eligible generation, but the same raw-row budget keeps that work
+        finite. Direct unbounded helper reads are rejected; public compatibility
+        reads substitute the same finite raw-row budget.
+        """
+        select_all = "SELECT * FROM messages WHERE session_id = ?" + active_clause
+
+        if limit is None:
+            raise ValueError("compacted display reads require a bounded limit")
+        if limit == 0:
+            return []
+
+        if latest and limit is not None and limit > 0:
+            need = offset + limit
+            if need > self._DISPLAY_RAW_ROW_BUDGET:
+                raise ValueError("compacted display read exceeded raw-row work budget")
+            window = min(
+                max(need * self._DISPLAY_TAIL_SCAN_FACTOR, self._DISPLAY_TAIL_SCAN_MIN),
+                self._DISPLAY_RAW_ROW_BUDGET + 1,
+            )
+            while True:
+                with self._read_ctx() as conn:
+                    scanned = conn.execute(
+                        select_all + " ORDER BY id DESC LIMIT ?",
+                        [session_id, window],
+                    ).fetchall()
+                if len(scanned) > self._DISPLAY_RAW_ROW_BUDGET:
+                    raise ValueError("compacted display read exceeded raw-row work budget")
+                seen: dict = {}
+                for row in scanned:
+                    key = self._display_dedupe_key(row)
+                    cur = seen.get(key)
+                    # Same winner rule as the full scan: live row first, then
+                    # newest generation. Scanning descending would otherwise
+                    # take the newest ARCHIVED copy over an older live row.
+                    if cur is None or (row["active"], row["id"]) > (cur["active"], cur["id"]):
+                        seen[key] = row
+                exhausted = len(scanned) < window
+                newest_first = sorted(seen.values(), key=lambda r: r["id"], reverse=True)
+                candidates = newest_first[offset : offset + limit]
+                # An unseen row can only change a touched dedupe group by
+                # supplying a live winner. If every candidate is already live,
+                # older physical copies cannot displace it. Otherwise continue
+                # until exhaustion, still under the finite geometric budget.
+                stable_candidates = len(candidates) == limit and all(
+                    row["active"] for row in candidates
+                )
+                if stable_candidates or exhausted:
+                    page = candidates
+                    page.reverse()
+                    return page
+                window = min(window * 4, self._DISPLAY_RAW_ROW_BUDGET + 1)
+
+        if limit is not None:
+            seen: dict = {}
+            raw_rows = 0
+            with self._read_ctx() as conn:
+                cursor = conn.execute(
+                    select_all + " ORDER BY id ASC",
+                    [session_id],
+                )
+                while True:
+                    remaining = self._DISPLAY_RAW_ROW_BUDGET - raw_rows
+                    batch = cursor.fetchmany(
+                        min(self._DISPLAY_STREAM_BATCH_SIZE, remaining + 1)
+                    )
+                    if not batch:
+                        break
+                    raw_rows += len(batch)
+                    if raw_rows > self._DISPLAY_RAW_ROW_BUDGET:
+                        raise ValueError(
+                            "compacted display read exceeded raw-row work budget"
+                        )
+                    for row in batch:
+                        key = self._display_dedupe_key(row)
+                        cur = seen.get(key)
+                        if cur is None or (row["active"], row["id"]) > (
+                            cur["active"],
+                            cur["id"],
+                        ):
+                            seen[key] = row
+
+            rows = sorted(seen.values(), key=lambda r: r["id"])
+            return rows[offset : offset + limit]
+
+
     def get_messages(
         self,
         session_id: str,
@@ -12848,63 +13235,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if after_id is not None:
             params.append(after_id)
         if include_compacted:
-            # Compaction epochs copy the protected tail into each new
-            # generation, so the same logical message can exist as several
-            # rows (identical role/content/timestamp) with different active
-            # flags and ids. A display read must surface each message exactly
-            # once: prefer the live row, then the newest generation. Read the
-            # full display set (a session's rows are bounded; the UI-level
-            # 500-row cap lives in the endpoint, not here), dedupe in Python,
-            # then apply paging.
-            with self._read_ctx() as conn:
-                cursor = conn.execute(
-                    "SELECT * FROM messages WHERE session_id = ?" + active_clause
-                    + " ORDER BY id ASC",
-                    [session_id],
-                )
-                all_rows = cursor.fetchall()
-            seen: dict = {}
-            for row in all_rows:
-                dedupe_content = row["content"]
-                if row["role"] == "user":
-                    from agent.context_compressor import split_user_originated_turn
-
-                    candidate = {
-                        "role": "user",
-                        "content": self._decode_content(row["content"]),
-                        "display_kind": row["display_kind"],
-                        "display_metadata": self._decode_display_metadata(
-                            row["display_metadata"]
-                        ),
-                    }
-                    handoff, live_view = split_user_originated_turn(candidate)
-                    if handoff is not None and live_view is not None:
-                        dedupe_content = self._encode_content(
-                            live_view.get("content")
-                        )
-                # Tool fields participate in the dedupe key: compaction copies
-                # them verbatim, so identical tool messages across generations
-                # still collapse, while distinct tool calls that happen to
-                # share role/content/timestamp are never merged.
-                key = (
-                    row["role"],
-                    dedupe_content,
-                    row["timestamp"],
-                    row["tool_call_id"],
-                    row["tool_calls"],
-                    row["tool_name"],
-                )
-                cur = seen.get(key)
-                if cur is None or (row["active"], row["id"]) > (cur["active"], cur["id"]):
-                    seen[key] = row
-            rows = sorted(seen.values(), key=lambda r: r["id"])
-            if latest:
-                rows = rows[::-1]
-            rows = rows[offset:]
-            if limit is not None:
-                rows = rows[:limit]
-            if latest:
-                rows = rows[::-1]
+            rows = self._deduped_display_rows(
+                session_id,
+                active_clause,
+                limit=(
+                    max(0, self._DISPLAY_RAW_ROW_BUDGET - offset)
+                    if limit is None
+                    else limit
+                ),
+                offset=offset,
+                latest=latest,
+            )
         else:
             if limit is not None or offset:
                 # SQLite's OFFSET requires LIMIT; -1 means "no limit".
@@ -13196,7 +13537,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         "finish_reason, reasoning, reasoning_content, reasoning_details, "
         "codex_reasoning_items, codex_message_items, platform_message_id, observed, "
         "_compressed_summary, timestamp, "
-        "api_content, display_kind, display_metadata"
+        "api_content, display_kind, display_metadata, logical_id, history_seq"
     )
 
     def _rows_to_conversation(
@@ -13247,6 +13588,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # strips it before the wire.
             if include_row_ids and row["id"] is not None:
                 msg["_row_id"] = row["id"]
+                if row["logical_id"] is not None:
+                    msg["logical_id"] = row["logical_id"]
+                if row["history_seq"] is not None:
+                    msg["history_seq"] = row["history_seq"]
             # api_content is the byte-fidelity sidecar: the exact string sent
             # to the API when it differed from the clean content. Returned
             # VERBATIM — no sanitize_context, no strip — because the replay
@@ -13379,7 +13724,34 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # widening the import surface at module load.
             from agent.agent_runtime_helpers import repair_message_sequence
 
+            identity_payloads = {
+                id(message): (
+                    message.get("role"),
+                    self._encode_content(message.get("content")),
+                    message.get("tool_call_id"),
+                    self._reasoning_json_text(message.get("tool_calls")),
+                    message.get("tool_name"),
+                )
+                for message in messages
+                if message.get("logical_id") is not None
+            }
             repaired = repair_message_sequence(None, messages)
+            for message in messages:
+                if message.get("logical_id") is None:
+                    continue
+                current_payload = (
+                    message.get("role"),
+                    self._encode_content(message.get("content")),
+                    message.get("tool_call_id"),
+                    self._reasoning_json_text(message.get("tool_calls")),
+                    message.get("tool_name"),
+                )
+                if identity_payloads.get(id(message)) != current_payload:
+                    # Sequence repair synthesized a different logical display
+                    # row. It must mint a new identity if persisted rather than
+                    # reusing the source row's immutable provenance.
+                    message.pop("logical_id", None)
+                    message.pop("history_seq", None)
             if repaired:
                 logger.info(
                     "Repaired %d message-alternation violation(s) while "

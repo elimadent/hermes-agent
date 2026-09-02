@@ -1267,16 +1267,83 @@ def _(rid, params: dict) -> dict:
         return err
     assert session is not None
 
-    return _ok(
-        rid,
-        _live_session_payload(
-            sid,
-            session,
-            touch=True,
-            transport=current_transport() or _stdio_transport,
-            omit_messages=is_truthy_value(params.get("omit_messages", False)),
-        ),
+    preflight_stored_id = str(
+        session.get("stored_session_id") or session.get("session_key") or ""
     )
+    preflight_capability = None
+    if preflight_stored_id:
+        try:
+            with _session_db(session) as db:
+                preflight_capability = db.ensure_history_cursor_capability(
+                    preflight_stored_id
+                )
+        except Exception:
+            preflight_capability = None
+
+    payload = _live_session_payload(
+        sid,
+        session,
+        touch=True,
+        transport=current_transport() or _stdio_transport,
+        omit_messages=is_truthy_value(params.get("omit_messages", False)),
+    )
+    stored_id = str(
+        payload.get("stored_session_id")
+        or payload.get("session_key")
+        or session.get("stored_session_id")
+        or session.get("session_key")
+        or ""
+    )
+    if stored_id:
+        try:
+            from gateway.platforms.api_server import _encode_history_cursor
+
+            with _session_db(session) as db:
+                capability = (
+                    preflight_capability
+                    if stored_id == preflight_stored_id
+                    else db.ensure_history_cursor_capability(stored_id)
+                )
+                if capability is None:
+                    capability = db.ensure_history_cursor_capability(stored_id)
+                if capability.get("status") != "available":
+                    payload["history_before_cursor"] = None
+                    return _ok(rid, payload)
+                payload["history_before_cursor"] = None
+                hydrated_messages = payload.get("messages") or []
+                hydrated_boundary = _activation_history_boundary(hydrated_messages, [])
+                page = db.get_history_cursor_page(
+                    stored_id,
+                    before_seq=hydrated_boundary,
+                    limit=1,
+                )
+                boundary = (
+                    hydrated_boundary
+                    if hydrated_boundary is not None
+                    else _activation_history_boundary([], page.get("messages") or [])
+                )
+                if page.get("messages") and boundary is not None:
+                    identity = db.history_cursor_identity()
+                    payload["history_before_cursor"] = _encode_history_cursor(
+                        {
+                            "v": 1,
+                            "session": stored_id,
+                            "profile": (
+                                Path(session["profile_home"]).name
+                                if session.get("profile_home")
+                                else _current_profile_name()
+                            ),
+                            "store": identity["store_uuid"],
+                            "cursor_epoch": capability["cursor_epoch"],
+                            "before_seq": int(boundary),
+                            "view": "compacted_display_v1",
+                            "direction": "older",
+                        },
+                        identity["signing_key"],
+                    )
+        except Exception:
+            payload["history_before_cursor"] = None
+    return _ok(rid, payload)
 
 
 @method("session.delete")

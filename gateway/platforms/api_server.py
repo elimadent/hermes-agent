@@ -41,6 +41,7 @@ Requires:
 """
 
 import asyncio
+import base64
 import concurrent.futures
 import errno
 import hashlib
@@ -138,6 +139,7 @@ except ImportError:
     web = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
+from gateway.query_params import parse_query_bool
 from gateway.platforms import api_server_room_dispatch as _room_dispatch
 from gateway.platforms import api_server_room_grants as _room_grants
 from gateway.platforms import api_server_runs as _api_runs
@@ -270,7 +272,68 @@ CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
 RESPONSES_AUTO_TRUNCATION_HISTORY_LIMIT = 100
+_SQLITE_SIGNED_64_MAX = (1 << 63) - 1
+_HISTORY_CURSOR_VIEW = "compacted_display_v1"
+_HISTORY_CURSOR_VERSION = 1
+_HISTORY_CURSOR_MAX_BYTES = 4096
+_HISTORY_CURSOR_FIELDS = {
+    "v", "session", "profile", "store", "cursor_epoch", "before_seq", "view", "direction",
+}
 _COMPRESSED_SUMMARY_METADATA_KEY = "_compressed_summary"
+
+
+class _HistoryCursorMismatch(Exception):
+    pass
+
+
+def _history_cursor_b64encode(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def _history_cursor_b64decode(value: str) -> bytes:
+    if not value or len(value) > _HISTORY_CURSOR_MAX_BYTES or not re.fullmatch(r"[A-Za-z0-9_-]+", value):
+        raise ValueError("invalid cursor encoding")
+    return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+
+
+def _encode_history_cursor(payload: Dict[str, Any], signing_key: str) -> str:
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    signature = hmac.new(bytes.fromhex(signing_key), raw, hashlib.sha256).digest()
+    return f"{_history_cursor_b64encode(raw)}.{_history_cursor_b64encode(signature)}"
+
+
+def _decode_history_cursor(token: str, signing_key: str) -> Dict[str, Any]:
+    if not isinstance(token, str) or len(token) > _HISTORY_CURSOR_MAX_BYTES or token.count(".") != 1:
+        raise ValueError("invalid cursor envelope")
+    body, encoded_signature = token.split(".", 1)
+    raw = _history_cursor_b64decode(body)
+    supplied_signature = _history_cursor_b64decode(encoded_signature)
+    expected_signature = hmac.new(bytes.fromhex(signing_key), raw, hashlib.sha256).digest()
+    if not hmac.compare_digest(supplied_signature, expected_signature):
+        raise ValueError("invalid cursor signature")
+
+    def _no_duplicates(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate cursor field")
+            result[key] = value
+        return result
+
+    payload = json.loads(raw.decode("utf-8"), object_pairs_hook=_no_duplicates)
+    if not isinstance(payload, dict) or set(payload) != _HISTORY_CURSOR_FIELDS:
+        raise ValueError("invalid cursor payload")
+    if type(payload["v"]) is not int or payload["v"] != _HISTORY_CURSOR_VERSION:
+        raise ValueError("unsupported cursor version")
+    if type(payload["before_seq"]) is not int or not 0 < payload["before_seq"] <= _SQLITE_SIGNED_64_MAX:
+        raise ValueError("invalid cursor boundary")
+    if payload["view"] != _HISTORY_CURSOR_VIEW or payload["direction"] != "older":
+        raise ValueError("invalid cursor projection")
+    for key in ("session", "profile", "store", "cursor_epoch"):
+        if not isinstance(payload[key], str) or not payload[key]:
+            raise ValueError("invalid cursor binding")
+    return payload
+
 
 
 class ThreadSafeAsyncQueue(asyncio.Queue):
@@ -3475,6 +3538,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_chat": True,
                 "session_chat_streaming": True,
                 "session_fork": True,
+                "session_history_cursor_v1": True,
                 "session_model_lock": True,
                 "admin_config_rw": False,
                 "jobs_admin": False,
@@ -4616,11 +4680,129 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
         session_id = request.match_info["session_id"]
+        page_mode = request.query.get("page_mode")
+        if page_mode is not None and page_mode != "cursor":
+            return web.json_response(
+                _openai_error("unsupported page_mode", code="invalid_pagination"), status=400
+            )
+        if page_mode == "cursor":
+            conflicts = {
+                "offset", "order", "include_compacted", "latest", "view", "projection", "direction"
+            }.intersection(request.query)
+            if conflicts:
+                return web.json_response(
+                    _openai_error(
+                        "cursor pagination cannot be combined with legacy pagination or projection parameters",
+                        code="invalid_cursor",
+                    ),
+                    status=400,
+                )
+        else:
+            try:
+                early_offset = int(request.query.get("offset", "0"))
+            except (TypeError, ValueError):
+                early_offset = -1
+            if early_offset < 0 or early_offset > _SQLITE_SIGNED_64_MAX:
+                return web.json_response(
+                    _openai_error(
+                        "offset is outside the supported pagination range",
+                        code="invalid_pagination",
+                    ),
+                    status=400,
+                )
         _, err = await self._get_existing_session_or_404(session_id)
         if err:
             return err
         db = await self._ensure_session_db_async()
         resolved_id = await asyncio.to_thread(db.resolve_resume_session_id, session_id)
+        if page_mode == "cursor":
+            raw_limit = request.query.get("limit", "100")
+            try:
+                cursor_limit = int(raw_limit)
+            except (TypeError, ValueError):
+                cursor_limit = -1
+            if cursor_limit < 1 or cursor_limit > 500:
+                return web.json_response(
+                    _openai_error("cursor limit must be an integer from 1 to 500", code="invalid_cursor"),
+                    status=400,
+                )
+            profile = _api_request_profile.get() or "default"
+            try:
+                capability = await asyncio.to_thread(db.ensure_history_cursor_capability, resolved_id)
+                if capability.get("status") != "available":
+                    return web.json_response(
+                        _openai_error(
+                            "immutable history cursor is unavailable for this session",
+                            code="cursor_unavailable",
+                        ),
+                        status=409,
+                    )
+                identity = await asyncio.to_thread(db.history_cursor_identity)
+                before_seq = None
+                encoded_cursor = request.query.get("cursor")
+                if encoded_cursor is not None:
+                    payload = _decode_history_cursor(encoded_cursor, identity["signing_key"])
+                    expected_bindings = {
+                        "session": resolved_id,
+                        "profile": profile,
+                        "store": identity["store_uuid"],
+                        "cursor_epoch": capability["cursor_epoch"],
+                    }
+                    if any(payload[key] != value for key, value in expected_bindings.items()):
+                        raise _HistoryCursorMismatch
+                    before_seq = payload["before_seq"]
+                page = await asyncio.to_thread(
+                    db.get_history_cursor_page,
+                    resolved_id,
+                    before_seq=before_seq,
+                    limit=cursor_limit,
+                )
+            except _HistoryCursorMismatch:
+                return web.json_response(
+                    _openai_error("history cursor belongs to another history", code="cursor_mismatch"),
+                    status=409,
+                )
+            except (ValueError, TypeError, json.JSONDecodeError, UnicodeError):
+                return web.json_response(
+                    _openai_error("invalid history cursor", code="invalid_cursor"), status=400
+                )
+
+            next_cursor = None
+            if page["has_more"]:
+                next_cursor = _encode_history_cursor(
+                    {
+                        "v": _HISTORY_CURSOR_VERSION,
+                        "session": resolved_id,
+                        "profile": profile,
+                        "store": identity["store_uuid"],
+                        "cursor_epoch": capability["cursor_epoch"],
+                        "before_seq": page["before_seq"],
+                        "view": _HISTORY_CURSOR_VIEW,
+                        "direction": "older",
+                    },
+                    identity["signing_key"],
+                )
+            cursor_messages = []
+            for message in page["messages"]:
+                projected = self._message_response(message)
+                projected["logical_id"] = message["logical_id"]
+                projected["history_seq"] = message["history_seq"]
+                cursor_messages.append(projected)
+            return web.json_response({
+                "object": "list",
+                "session_id": resolved_id,
+                "data": cursor_messages,
+                "pagination": {
+                    "mode": "cursor",
+                    "limit": cursor_limit,
+                    "returned": len(cursor_messages),
+                    "view": _HISTORY_CURSOR_VIEW,
+                    "cursor_epoch": capability["cursor_epoch"],
+                    "has_more": page["has_more"],
+                    "next_cursor": next_cursor,
+                },
+            })
+
         raw_limit = request.query.get("limit")
         raw_offset = request.query.get("offset", "0")
         order = request.query.get("order")
@@ -4647,16 +4829,71 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=400,
             )
 
+        # Opt-in display history. Without this, a client paging backwards stops
+        # dead at the newest compaction boundary: rows preserved by in-place
+        # compaction (active=0, compacted=1) are durable transcript the user
+        # can still scroll to, but the default active-only read hides them, so
+        # earlier turns look like they simply do not exist. Opt-in (not the
+        # default) because existing callers page the active conversation and
+        # must not silently start receiving archived generations.
+        try:
+            include_compacted = parse_query_bool(
+                request.query.get("include_compacted")
+                if "include_compacted" in request.query
+                else None
+            )
+        except ValueError:
+            return web.json_response(
+                _openai_error(
+                    "include_compacted must be one of: 1, true, yes, on, t, y, 0, false, no, off, f, n",
+                    code="invalid_pagination",
+                ),
+                status=400,
+            )
+
         default_page = requested_limit is None
         latest_page = order == "latest" or (order is None and default_page)
         limit = 500 if default_page else min(requested_limit, 500)
-        messages = await asyncio.to_thread(
-            db.get_messages,
-            resolved_id,
-            limit=limit,
-            offset=offset,
-            latest=latest_page,
-        )
+        # Read one bounded lookahead row so a full final page can be
+        # distinguished from a page that truly has more history. limit=0 is a
+        # legal empty page and deliberately does not overfetch.
+        fetch_limit = limit + 1 if limit > 0 else 0
+        # SQLite integer binds are signed 64-bit. Reserve room for the
+        # lookahead in offset + fetch_limit before either value reaches the DB
+        # helper, where the sum is used to size the bounded display scan.
+        compacted_offset_max = db._DISPLAY_RAW_ROW_BUDGET - fetch_limit
+        if offset > _SQLITE_SIGNED_64_MAX - fetch_limit or (
+            include_compacted and offset > compacted_offset_max
+        ):
+            return web.json_response(
+                _openai_error(
+                    "offset is outside the supported pagination range",
+                    code="invalid_pagination",
+                ),
+                status=400,
+            )
+
+        try:
+            fetched_messages = await asyncio.to_thread(
+                db.get_messages,
+                resolved_id,
+                include_compacted=include_compacted,
+                limit=fetch_limit,
+                offset=offset,
+                latest=latest_page,
+            )
+        except ValueError as exc:
+            if str(exc) != "compacted display read exceeded raw-row work budget":
+                raise
+            return web.json_response(
+                _openai_error(
+                    "requested compacted page exceeds the bounded history scan",
+                    code="pagination_work_limit",
+                ),
+                status=400,
+            )
+        has_more = limit > 0 and len(fetched_messages) > limit
+        messages = fetched_messages[-limit:] if latest_page and limit > 0 else fetched_messages[:limit]
         return web.json_response({
             "object": "list",
             "session_id": resolved_id,
@@ -4666,6 +4903,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 "offset": offset,
                 "order": order or ("latest" if default_page else "oldest"),
                 "returned": len(messages),
+                "include_compacted": include_compacted,
+                "has_more": has_more,
             },
         })
 

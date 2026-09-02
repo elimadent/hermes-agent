@@ -16,6 +16,8 @@ import asyncio  # noqa: F401 — used by handlers
 import json
 import logging
 import sqlite3
+import re
+import sys
 import time  # noqa: F401
 from typing import Any, Dict, List, Optional  # noqa: F401
 
@@ -23,6 +25,7 @@ from fastapi import APIRouter, HTTPException, Query, Request  # noqa: F401
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import StreamingResponse
 
+from gateway.query_params import parse_query_bool
 from hermes_cli.web_deps import late
 from hermes_cli.web_models import (
     BulkDeleteSessions,
@@ -86,12 +89,74 @@ def _resolve_session_id(db, session_id: str) -> Optional[str]:
         ) from exc
 
 
+def _clean_search_excerpt(value: Any) -> str:
+    """Turn FTS/JSON storage text into a compact display-safe excerpt.
+
+    SQLite FTS highlights matches with ``>>>``/``<<<`` and some message rows
+    store their visible text inside one or more JSON wrappers. API consumers
+    should not have to understand either storage representation.
+    """
+    text = "" if value is None else str(value).strip()
+    for _ in range(3):
+        if not text or text[0] not in "[{":
+            break
+        try:
+            decoded = json.loads(text)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            break
+        candidate = None
+        if isinstance(decoded, dict):
+            for key in ("content", "text", "message", "output", "result", "snippet"):
+                if decoded.get(key) not in (None, ""):
+                    candidate = decoded[key]
+                    break
+        elif isinstance(decoded, list):
+            candidate = next((item for item in decoded if item not in (None, "")), None)
+        if candidate is None:
+            break
+        if isinstance(candidate, (dict, list)):
+            text = json.dumps(candidate, ensure_ascii=False)
+        else:
+            text = str(candidate)
+    text = text.replace(">>>", "").replace("<<<", "").replace("\\n", " ")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _authoritative_running_session_ids() -> set[str]:
+    """Return persisted IDs that currently own a live gateway turn.
+
+    Activity timestamps include tool and log writes, so they cannot establish
+    that an agent turn is still running. If the runtime registry is unavailable,
+    fail closed rather than reviving finished sessions from recent activity.
+    """
+    server = sys.modules.get("tui_gateway.server")
+    sessions = getattr(server, "_sessions", None)
+    lock = getattr(server, "_sessions_lock", None)
+    if not isinstance(sessions, dict) or lock is None:
+        return set()
+
+    try:
+        with lock:
+            snapshot = list(sessions.values())
+    except (AttributeError, RuntimeError, TypeError):
+        _log.warning("Gateway runtime registry unavailable while listing sessions")
+        return set()
+
+    return {
+        str(state["session_key"])
+        for state in snapshot
+        if isinstance(state, dict)
+        and state.get("running") is True
+        and state.get("session_key")
+    }
+
+
 @list_router.get("/api/sessions")
 def get_sessions(
-    # ``le=100`` caps the page size (idea from #39200): an unbounded limit
-    # lets one request drag every session row (plus correlated-subquery
-    # preview work) out of SQLite in a single hit.
-    limit: int = Query(20, ge=0, le=100),
+    # ``le=500`` matches GET /api/profiles/sessions. ``le=100`` 422'd real
+    # mobile clients that send the current session count (observed 159).
+    # Unbounded fetches are still rejected.
+    limit: int = Query(20, ge=0, le=500),
     offset: int = Query(0, ge=0),
     min_messages: int = 0,
     archived: str = "exclude",
@@ -175,16 +240,13 @@ def get_sessions(
                 archived_only=archived_only,
                 exclude_children=True,
             )
-            now = time.time()
+            running_session_ids = _authoritative_running_session_ids()
             # Same ownership contract as get_session_detail: rows are stamped
             # with the serving profile even when the request wasn't explicitly
             # scoped, so default-profile rows never circulate unowned.
             row_profile = profile_name or _cron_default_profile()
             for s in sessions:
-                s["is_active"] = (
-                    s.get("ended_at") is None
-                    and (now - s.get("last_active", s.get("started_at", 0))) < 300
-                )
+                s["is_active"] = str(s.get("id")) in running_session_ids
                 s["profile"] = row_profile
                 s["is_default_profile"] = row_profile == "default"
                 # SQLite stores the flag as 0/1; expose a real JSON boolean.
@@ -211,10 +273,10 @@ async def search_sessions(
     sources: str = None,
     exclude_sources: str = None,
 ):
-    """Search sessions by ID plus full-text message content using FTS5.
+    """Search titles, IDs, and message content; return conversations newest first.
 
-    Direct session-id matches are surfaced first, then FTS message-content
-    matches. Results are deduped by compression lineage, not by raw
+    Candidate/excerpt priority is title, session ID, user text, assistant text,
+    then system/tool output. Results are deduped by compression lineage, not by raw
     ``session_id``. Auto-compression rotates a conversation onto a fresh
     session id (and leaves the old segment's messages in the FTS index), so one
     logical chat can own many ``sessions`` rows that all match the same query.
@@ -227,6 +289,10 @@ async def search_sessions(
         db = _open_session_db_for_profile(profile, read_only=True)
         try:
             safe_limit = max(1, min(int(limit or 20), 100))
+            # Each match lane over-fetches before the final recency sort. Limiting while
+            # traversing FTS rank was the reason old tool-output hits appeared above newer
+            # chats and could crowd title/user matches out of the result set.
+            fetch_limit = max(safe_limit * 5, 50)
             source_filter = source or None
             source_list = [s.strip() for s in (sources or "").split(",") if s.strip()]
             include_sources = [source_filter] if source_filter else (source_list or None)
@@ -303,19 +369,20 @@ async def search_sessions(
                 tip_cache[root_id] = tip
                 return tip
 
-            # Both ID matches and content matches share one keyspace, keyed by
+            # Every match lane shares one keyspace, keyed by
             # compression lineage root, so an id-hit and a content-hit on the
             # same logical conversation collapse to a single result. The first
-            # hit for a lineage wins; ID matches run first and take priority.
+            # hit for a lineage wins, which selects the cleanest available excerpt.
             seen: dict = {}
 
             def add_lineage_result(raw_sid: str, payload: dict) -> None:
                 if not raw_sid:
                     return
                 root = compression_root(raw_sid)
-                if root in seen or len(seen) >= safe_limit:
+                if root in seen:
                     return
                 payload = dict(payload)
+                payload["snippet"] = _clean_search_excerpt(payload.get("snippet"))
                 sid = lineage_tip(root)
                 payload["session_id"] = sid
                 payload["lineage_root"] = root
@@ -350,7 +417,38 @@ async def search_sessions(
                     payload["id"] = sid
                 seen[root] = payload
 
-            # Direct ID matches first: users often paste a session id from CLI,
+            # Titles are the most human-meaningful field. list_sessions_rich performs a
+            # SQL-bounded, case-insensitive title/id search; filter its mixed result back to
+            # genuine title matches because IDs have their own lane immediately below.
+            normalized_query = re.sub(r"[^a-z0-9]+", "", q.lower())
+            for row in db.list_sessions_rich(
+                source=source_filter,
+                sources=source_list or None,
+                exclude_sources=exclude_list or None,
+                limit=fetch_limit,
+                offset=0,
+                include_archived=True,
+                order_by_last_active=True,
+                search_query=q,
+                compact_rows=True,
+            ):
+                title = (row.get("title") or "").strip()
+                normalized_title = re.sub(r"[^a-z0-9]+", "", title.lower())
+                if not normalized_query or normalized_query not in normalized_title:
+                    continue
+                add_lineage_result(
+                    row.get("id"),
+                    {
+                        "snippet": (row.get("preview") or "").strip(),
+                        "role": None,
+                        "match_field": "title",
+                        "source": row.get("source"),
+                        "model": row.get("model"),
+                        "session_started": row.get("started_at"),
+                    },
+                )
+
+            # Direct ID matches next: users often paste a session id from CLI,
             # logs, or another Hermes surface. FTS can't find those unless the
             # id happens to appear in message text. search_sessions_by_id is
             # SQL-bounded, so this stays cheap even with thousands of sessions.
@@ -370,6 +468,7 @@ async def search_sessions(
                     {
                         "snippet": snippet,
                         "role": None,
+                        "match_field": "session_id",
                         "source": row.get("source"),
                         "model": row.get("model"),
                         "session_started": row.get("started_at"),
@@ -379,7 +478,6 @@ async def search_sessions(
             # Auto-add prefix wildcards so partial words match
             # e.g. "nimb" → "nimb*" matches "nimby"
             # Preserve quoted phrases and existing wildcards as-is
-            import re
             terms = []
             for token in re.findall(r'"[^"]*"|\S+', q.strip()):
                 if token.startswith('"') or token.endswith("*"):
@@ -387,38 +485,57 @@ async def search_sessions(
                 else:
                     terms.append(token + "*")
             prefix_query = " ".join(terms)
-            # Over-fetch so lineage dedup can still surface `limit` distinct
-            # conversations even when several hits collapse onto one root.
-            fetch_limit = max(safe_limit * 5, 50)
-            matches = db.search_messages(
-                query=prefix_query,
-                source_filter=include_sources,
-                exclude_sources=exclude_list or None,
-                limit=fetch_limit,
-                fields=(
-                    "session_id",
-                    "role",
-                    "snippet",
-                    "source",
-                    "model",
-                    "session_started",
-                ),
+            fields = (
+                "session_id",
+                "role",
+                "snippet",
+                "source",
+                "model",
+                "session_started",
             )
-
-            for m in matches:
-                if len(seen) >= safe_limit:
-                    break
-                add_lineage_result(
-                    m["session_id"],
-                    {
-                        "snippet": m.get("snippet", ""),
-                        "role": m.get("role"),
-                        "source": m.get("source"),
-                        "model": m.get("model"),
-                        "session_started": m.get("session_started"),
-                    },
+            # Search human conversation before machine-produced output. This does not
+            # override newest-first presentation; it chooses which excerpt wins when the
+            # same conversation matches in several places.
+            for roles, match_field in (
+                (("user",), "user_message"),
+                (("assistant",), "assistant_message"),
+                (("system", "tool"), "tool_output"),
+            ):
+                matches = db.search_messages(
+                    query=prefix_query,
+                    source_filter=include_sources,
+                    exclude_sources=exclude_list or None,
+                    role_filter=list(roles),
+                    limit=fetch_limit,
+                    fields=fields,
                 )
-            return {"results": list(seen.values())}
+                for m in matches:
+                    add_lineage_result(
+                        m["session_id"],
+                        {
+                            "snippet": m.get("snippet", ""),
+                            "role": m.get("role"),
+                            "match_field": match_field,
+                            "source": m.get("source"),
+                            "model": m.get("model"),
+                            "session_started": m.get("session_started"),
+                        },
+                    )
+
+            def result_recency(payload: dict) -> float:
+                return float(
+                    payload.get("last_active")
+                    or payload.get("session_started")
+                    or payload.get("started_at")
+                    or 0
+                )
+
+            newest_first = sorted(
+                seen.values(),
+                key=lambda payload: (result_recency(payload), payload.get("session_id") or ""),
+                reverse=True,
+            )
+            return {"results": newest_first[:safe_limit]}
         finally:
             db.close()
     except HTTPException:
@@ -644,15 +761,40 @@ async def get_session_messages(
     session_id: str,
     profile: Optional[str] = None,
     limit: Optional[int] = Query(None, ge=0),
-    offset: int = Query(0, ge=0),
+    offset: int = Query(0, ge=0, le=(1 << 63) - 1),
     order: Optional[str] = Query(None),
-    include_compacted: bool = Query(False),
+    include_compacted: Optional[str] = Query(None),
 ):
+    try:
+        include_compacted_value = parse_query_bool(include_compacted)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "invalid_pagination",
+                "message": "include_compacted must be one of: 1, true, yes, on, t, y, 0, false, no, off, f, n",
+            },
+        ) from exc
     if order not in (None, "oldest", "latest"):
         raise HTTPException(
             status_code=400,
             detail="order must be one of: oldest, latest",
         )
+
+    default_page = limit is None
+    latest_page = order == "latest" or (order is None and default_page)
+    _limit = 500 if default_page else min(limit, 500)
+    if include_compacted_value:
+        from hermes_state import SessionDB
+
+        if offset > SessionDB._DISPLAY_RAW_ROW_BUDGET - _limit:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "invalid_pagination",
+                    "message": "offset is outside the supported pagination range",
+                },
+            )
 
     def _read():
         db = _open_session_db_for_profile(profile, read_only=True)
@@ -666,20 +808,28 @@ async def get_session_messages(
             # for a runaway session and exhaust the dashboard process. Keep
             # explicit pagination anchored at the start, while the default
             # dashboard view returns the latest page in chronological order.
-            default_page = limit is None
-            latest_page = order == "latest" or (order is None and default_page)
-            _limit = 500 if default_page else min(limit, 500)
             return sid, _limit, db.get_messages(
                 sid,
                 limit=_limit,
                 offset=offset,
                 latest=latest_page,
-                include_compacted=include_compacted,
+                include_compacted=include_compacted_value,
             )
         finally:
             db.close()
 
-    result = await asyncio.to_thread(_read)
+    try:
+        result = await asyncio.to_thread(_read)
+    except ValueError as exc:
+        if str(exc) != "compacted display read exceeded raw-row work budget":
+            raise
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "pagination_work_limit",
+                "message": "requested compacted page exceeds the bounded history scan",
+            },
+        ) from exc
     if result is None:
         raise HTTPException(status_code=404, detail="Session not found")
     sid, _limit, messages = result

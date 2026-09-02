@@ -9638,9 +9638,39 @@ def _legacy_display_kind(role: str, text: str) -> str | None:
     return None
 
 
+def _activation_history_boundary(messages: list[dict], newest_page: list[dict]) -> int | None:
+    """Return the exclusive immutable-history boundary for an activation payload."""
+    hydrated = [
+        int(message["history_seq"])
+        for message in messages
+        if isinstance(message.get("history_seq"), int) and message["history_seq"] > 0
+    ]
+    if hydrated:
+        return min(hydrated)
+    usable = [
+        int(message["history_seq"])
+        for message in newest_page
+        if isinstance(message.get("history_seq"), int) and message["history_seq"] > 0
+    ]
+    if not usable:
+        return None
+    newest = max(usable)
+    if newest >= (1 << 63) - 1:
+        return None
+    return newest + 1
+
+
 def _history_to_messages(history: list[dict]) -> list[dict]:
     messages = []
     tool_call_args = {}
+
+    def _preserve_provenance(source: dict, target: dict) -> None:
+        if source.get("_row_id") is not None:
+            target["row_id"] = source["_row_id"]
+        if source.get("logical_id") is not None:
+            target["logical_id"] = source["logical_id"]
+        if source.get("history_seq") is not None:
+            target["history_seq"] = source["history_seq"]
 
     for m in history:
         if not isinstance(m, dict):
@@ -9686,6 +9716,7 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
             # truncation was permanent.
             if args:
                 tool_msg["args"] = args
+            _preserve_provenance(m, tool_msg)
             messages.append(tool_msg)
             continue
         # An assistant turn may carry only reasoning/thinking content with no
@@ -9719,6 +9750,7 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
         # reactions — needs this instead.
         if m.get("_row_id") is not None:
             msg["row_id"] = m["_row_id"]
+        _preserve_provenance(m, msg)
         if role == "user":
             invocation = _skill_scaffold_projection(content_text)
             if invocation:

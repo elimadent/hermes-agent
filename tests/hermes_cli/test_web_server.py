@@ -399,6 +399,64 @@ class TestWebServerEndpoints:
         assert response.json()["sessions"] == []
         assert response.json()["total"] == 0
 
+    def test_get_sessions_recent_activity_without_live_turn_is_not_active(self):
+        """A recent tool/log write is not proof that a turn is still running."""
+        from hermes_constants import get_hermes_home
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=get_hermes_home() / "state.db")
+        try:
+            db.create_session("recent-but-idle", source="api_server")
+            db.append_message("recent-but-idle", role="user", content="finished")
+        finally:
+            db.close()
+
+        response = self.client.get("/api/sessions?limit=50&offset=0")
+
+        assert response.status_code == 200
+        row = next(item for item in response.json()["sessions"] if item["id"] == "recent-but-idle")
+        assert row["is_active"] is False
+
+    def test_get_sessions_marks_only_authoritative_live_turn_active(self, monkeypatch):
+        from hermes_constants import get_hermes_home
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=get_hermes_home() / "state.db")
+        try:
+            db.create_session("actually-running", source="api_server")
+            db.create_session("recent-but-finished", source="api_server")
+            db.append_message("actually-running", role="user", content="work")
+            db.append_message("recent-but-finished", role="user", content="done")
+        finally:
+            db.close()
+
+        fake_server = SimpleNamespace(
+            _sessions_lock=threading.RLock(),
+            _sessions={
+                "test-live-authoritative-turn": {
+                    "session_key": "actually-running",
+                    "running": True,
+                }
+            },
+            _methods={},
+            _cfg_cache=None,
+            _cfg_mtime=None,
+            _cfg_path=None,
+            _db=None,
+            _db_error=None,
+            _real_stdout=None,
+        )
+        fake_server._close_session_by_id = (
+            lambda sid, end_reason=None: fake_server._sessions.pop(sid, None)
+        )
+        monkeypatch.setitem(sys.modules, "tui_gateway.server", fake_server)
+        response = self.client.get("/api/sessions?limit=50&offset=0")
+
+        assert response.status_code == 200
+        rows = {item["id"]: item for item in response.json()["sessions"]}
+        assert rows["actually-running"]["is_active"] is True
+        assert rows["recent-but-finished"]["is_active"] is False
+
     @pytest.mark.parametrize(
         "missing_column", ["archived", "pinned", "last_activity_at"]
     )
@@ -2093,6 +2151,34 @@ class TestWebServerEndpoints:
         resp = self.client.get("/api/sessions/neg-offset-messages/messages?offset=-1")
         assert resp.status_code == 422
 
+    def test_get_session_messages_rejects_offset_above_signed_64_even_with_zero_limit(self):
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session(session_id="huge-offset-messages", source="cli")
+        finally:
+            db.close()
+
+        resp = self.client.get(
+            "/api/sessions/huge-offset-messages/messages?limit=0&offset=9223372036854775808"
+        )
+        assert resp.status_code in (400, 422)
+
+    def test_get_session_messages_rejects_malformed_include_compacted(self):
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session(session_id="bad-include-token", source="cli")
+        finally:
+            db.close()
+
+        resp = self.client.get(
+            "/api/sessions/bad-include-token/messages?include_compacted=definitely"
+        )
+        assert resp.status_code in (400, 422)
+
     def test_get_session_messages_limit_above_500_is_capped_not_rejected(self):
         """A limit above the documented 500-row cap is silently clamped
         (existing ``min(limit, 500)`` behaviour), not rejected — the request
@@ -2178,6 +2264,69 @@ class TestWebServerEndpoints:
         assert resp.status_code == 200
         contents = [m["content"] for m in resp.json()["messages"]]
         assert contents == ["old q", "old a", "summary", "live q", "live a"]
+
+    def test_get_session_messages_include_compacted_validates_raw_budget_offset(self):
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session(session_id="compacted-offset-budget", source="cli")
+        finally:
+            db.close()
+
+        maximum_safe_offset = SessionDB._DISPLAY_RAW_ROW_BUDGET - 1
+        accepted = self.client.get(
+            "/api/sessions/compacted-offset-budget/messages"
+            f"?include_compacted=true&limit=1&offset={maximum_safe_offset}"
+        )
+        rejected = self.client.get(
+            "/api/sessions/compacted-offset-budget/messages"
+            f"?include_compacted=true&limit=1&offset={maximum_safe_offset + 1}"
+        )
+        assert accepted.status_code == 200
+        assert rejected.status_code == 400
+        assert rejected.json()["detail"]["code"] == "invalid_pagination"
+
+    def test_get_session_messages_include_compacted_budget_failure_is_bounded_error(
+        self, monkeypatch
+    ):
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            sid = "compacted-dashboard-budget"
+            db.create_session(session_id=sid, source="cli")
+            db.append_messages_batch(
+                sid,
+                [{"role": "user", "content": f"msg {i}"} for i in range(12)],
+            )
+
+            def _copy(conn):
+                conn.execute(
+                    """
+                    INSERT INTO messages
+                        (session_id, role, content, tool_call_id, tool_calls,
+                         tool_name, timestamp, active, compacted)
+                    SELECT session_id, role, content, tool_call_id, tool_calls,
+                           tool_name, timestamp, 0, 1
+                    FROM messages
+                    WHERE session_id = ? AND active = 1
+                    """,
+                    [sid],
+                )
+
+            db._execute_write(_copy)
+            db._execute_write(_copy)
+        finally:
+            db.close()
+
+        monkeypatch.setattr(SessionDB, "_DISPLAY_RAW_ROW_BUDGET", 20)
+        resp = self.client.get(
+            f"/api/sessions/{sid}/messages"
+            "?include_compacted=true&order=oldest&limit=4"
+        )
+        assert resp.status_code == 400
+        assert resp.json()["detail"]["code"] == "pagination_work_limit"
 
     def test_get_session_messages_projects_and_dedupes_composite_carrier(self):
         from agent.context_compressor import (

@@ -53,6 +53,24 @@ def _create_session_app(adapter: APIServerAdapter) -> web.Application:
     return app
 
 
+def _copy_messages_as_compacted_generation(session_db, session_id):
+    def _copy(conn):
+        conn.execute(
+            """
+            INSERT INTO messages
+                (session_id, role, content, tool_call_id, tool_calls,
+                 tool_name, timestamp, active, compacted)
+            SELECT session_id, role, content, tool_call_id, tool_calls,
+                   tool_name, timestamp, 0, 1
+            FROM messages
+            WHERE session_id = ? AND active = 1
+            """,
+            [session_id],
+        )
+
+    session_db._execute_write(_copy)
+
+
 @pytest.mark.asyncio
 async def test_capabilities_advertises_session_control_surface(adapter):
     app = _create_session_app(adapter)
@@ -107,6 +125,10 @@ async def test_session_messages_default_to_latest_bounded_page(adapter, session_
         "offset": 0,
         "order": "latest",
         "returned": 500,
+        # Existing callers keep the active-only projection by default.
+        "include_compacted": False,
+        # A full page means at least one more page exists below it.
+        "has_more": True,
     }
     assert payload["data"][0]["content"] == "msg 1"
     assert payload["data"][-1]["content"] == "msg 500"
@@ -114,6 +136,227 @@ async def test_session_messages_default_to_latest_bounded_page(adapter, session_
         "msg 1",
         "msg 2",
     ]
+    # A full page means more history exists below it; this session has 501.
+    assert explicit["pagination"]["has_more"] is True
+
+
+@pytest.mark.asyncio
+async def test_session_messages_exact_full_final_page_does_not_claim_more(
+    adapter, session_db
+):
+    session_id = session_db.create_session("exact-full-final-page", "api_server")
+    session_db.append_messages_batch(
+        session_id,
+        [{"role": "user", "content": f"msg {i}"} for i in range(2)],
+    )
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.get(f"/api/sessions/{session_id}/messages?limit=2")
+        assert resp.status == 200
+        payload = await resp.json()
+
+    assert [message["content"] for message in payload["data"]] == ["msg 0", "msg 1"]
+    assert payload["pagination"]["returned"] == 2
+    assert payload["pagination"]["has_more"] is False
+
+
+@pytest.mark.asyncio
+async def test_session_messages_one_extra_row_claims_more(adapter, session_db):
+    session_id = session_db.create_session("one-extra-row", "api_server")
+    session_db.append_messages_batch(
+        session_id,
+        [{"role": "user", "content": f"msg {i}"} for i in range(3)],
+    )
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.get(f"/api/sessions/{session_id}/messages?limit=2")
+        assert resp.status == 200
+        payload = await resp.json()
+
+    assert [message["content"] for message in payload["data"]] == ["msg 0", "msg 1"]
+    assert payload["pagination"]["returned"] == 2
+    assert payload["pagination"]["has_more"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("logical_count", "expected_contents", "expected_has_more"),
+    [(2, ["msg 0", "msg 1"], False), (3, ["msg 1", "msg 2"], True)],
+)
+async def test_session_messages_latest_compacted_exact_boundary_and_one_extra(
+    adapter, session_db, logical_count, expected_contents, expected_has_more
+):
+    session_id = session_db.create_session(
+        f"latest-compacted-{logical_count}", "api_server"
+    )
+    session_db.append_messages_batch(
+        session_id,
+        [{"role": "user", "content": f"msg {i}"} for i in range(logical_count)],
+    )
+    _copy_messages_as_compacted_generation(session_db, session_id)
+    _copy_messages_as_compacted_generation(session_db, session_id)
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.get(
+            f"/api/sessions/{session_id}/messages"
+            "?include_compacted=true&order=latest&limit=2"
+        )
+        assert resp.status == 200
+        payload = await resp.json()
+    assert [message["content"] for message in payload["data"]] == expected_contents
+    assert payload["pagination"]["has_more"] is expected_has_more
+
+
+@pytest.mark.asyncio
+async def test_session_messages_rejects_offset_above_sqlite_signed_64_bit(
+    adapter, session_db
+):
+    session_id = session_db.create_session("oversized-offset", "api_server")
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.get(
+            f"/api/sessions/{session_id}/messages?limit=1&offset=9223372036854775808"
+        )
+        assert resp.status == 400
+        payload = await resp.json()
+
+    assert payload["error"]["code"] == "invalid_pagination"
+
+
+@pytest.mark.asyncio
+async def test_session_messages_accepts_maximum_raw_budget_offset_and_rejects_one_over(
+    adapter, session_db
+):
+    session_id = session_db.create_session("raw-budget-offset", "api_server")
+    maximum_safe_offset = SessionDB._DISPLAY_RAW_ROW_BUDGET - 2
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        accepted = await cli.get(
+            f"/api/sessions/{session_id}/messages"
+            f"?include_compacted=true&limit=1&offset={maximum_safe_offset}"
+        )
+        rejected = await cli.get(
+            f"/api/sessions/{session_id}/messages"
+            f"?include_compacted=true&limit=1&offset={maximum_safe_offset + 1}"
+        )
+        rejected_payload = await rejected.json()
+    assert accepted.status == 200
+    assert rejected.status == 400
+    assert rejected_payload["error"]["code"] == "invalid_pagination"
+
+
+@pytest.mark.asyncio
+async def test_session_messages_compacted_scan_budget_failure_is_bounded_error(
+    adapter, session_db, monkeypatch
+):
+    session_id = session_db.create_session("compacted-work-budget", "api_server")
+    session_db.append_messages_batch(
+        session_id,
+        [{"role": "user", "content": f"msg {i}"} for i in range(12)],
+    )
+    _copy_messages_as_compacted_generation(session_db, session_id)
+    _copy_messages_as_compacted_generation(session_db, session_id)
+    monkeypatch.setattr(SessionDB, "_DISPLAY_RAW_ROW_BUDGET", 20)
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.get(
+            f"/api/sessions/{session_id}/messages"
+            "?include_compacted=true&order=oldest&limit=4"
+        )
+        payload = await resp.json()
+    assert resp.status == 400
+    assert payload["error"]["code"] == "pagination_work_limit"
+
+
+@pytest.mark.asyncio
+async def test_session_messages_zero_limit_does_not_claim_more(adapter, session_db):
+    """`limit=0` must not answer "there is more" on a page containing nothing.
+
+    Only negative values are rejected, so `limit=0` is a legal request. Its page is
+    necessarily empty, and an empty page trivially has `len(messages) == limit` — so a
+    naive full-page test reports `has_more: true` forever. A client that trusts the
+    signal to decide whether to keep paging never terminates.
+    """
+    session_id = session_db.create_session("zero-limit", "api_server")
+    session_db.append_messages_batch(
+        session_id,
+        [{"role": "user", "content": f"msg {i}"} for i in range(3)],
+    )
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.get(f"/api/sessions/{session_id}/messages?limit=0")
+        assert resp.status == 200
+        payload = await resp.json()
+
+    assert payload["data"] == []
+    assert payload["pagination"]["returned"] == 0
+    assert payload["pagination"]["has_more"] is False
+
+
+@pytest.mark.asyncio
+async def test_session_messages_opt_in_exposes_compacted_display_history(
+    adapter, session_db
+):
+    """Rows preserved by in-place compaction are reachable only on request.
+
+    This is precisely why a phone client cannot scroll past the newest
+    compaction boundary: the active-only default hides durable transcript the
+    user can still legitimately page back to. Opting in must surface it, and
+    NOT opting in must leave the existing projection untouched.
+    """
+    session_id = session_db.create_session("compacted-history", "api_server")
+    session_db.append_messages_batch(
+        session_id,
+        [{"role": "user", "content": f"old {i}"} for i in range(4)],
+    )
+    session_db.archive_and_compact(
+        session_id,
+        [
+            {"role": "assistant", "content": "summary of old turns"},
+            {"role": "user", "content": "live 0"},
+        ],
+    )
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        default_resp = await cli.get(f"/api/sessions/{session_id}/messages")
+        assert default_resp.status == 200
+        default_payload = await default_resp.json()
+
+        opted_resp = await cli.get(
+            f"/api/sessions/{session_id}/messages?include_compacted=true"
+        )
+        assert opted_resp.status == 200
+        opted_payload = await opted_resp.json()
+
+    default_contents = [m["content"] for m in default_payload["data"]]
+    opted_contents = [m["content"] for m in opted_payload["data"]]
+
+    # Unchanged for every existing caller: the archived generation stays hidden.
+    assert not any(c.startswith("old ") for c in default_contents)
+    assert default_payload["pagination"]["include_compacted"] is False
+
+    # Opting in reaches back past the compaction boundary...
+    assert [c for c in opted_contents if c.startswith("old ")] == [
+        "old 0",
+        "old 1",
+        "old 2",
+        "old 3",
+    ]
+    # ...without losing the live tail, and still chronological.
+    assert opted_contents[-len(default_contents):] == default_contents
+    assert opted_payload["pagination"]["include_compacted"] is True
+
+    # Every row carries the durable database id the client uses as a stable
+    # identity across reloads and page boundaries.
+    ids = [m["id"] for m in opted_payload["data"]]
+    assert ids and all(isinstance(i, int) for i in ids)
+    assert ids == sorted(ids)
+    assert len(set(ids)) == len(ids)
 
 
 @pytest.mark.asyncio
