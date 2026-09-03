@@ -97,7 +97,50 @@ def _slice_ids(payload, slice_name):
     return {row["id"] for row in payload[slice_name]["sessions"]}
 
 
+def _project_tree_session_rows(payload):
+    """All session-shaped rows exposed by the project-tree response."""
+    rows = []
+    for project in payload["projects"]:
+        rows.extend(project.get("previewSessions") or [])
+        for repo in project.get("repos") or []:
+            for lane in repo.get("groups") or []:
+                rows.extend(lane.get("sessions") or [])
+    return rows
+
+
 class TestSidebarScope:
+
+    def test_search_binds_explicit_profile_to_its_session_store(
+        self, client, profiles_on_disk
+    ):
+        """An explicit profile must never silently search the default DB."""
+        marker = "selected-profile-search-marker"
+        from hermes_state import SessionDB
+
+        for name, home in profiles_on_disk.items():
+            db = SessionDB(db_path=home / "state.db")
+            try:
+                db.create_session(f"{name}-search-result", source="cli")
+                db.append_message(
+                    session_id=f"{name}-search-result", role="user", content=marker
+                )
+            finally:
+                db.close()
+
+        default_results = client.get(
+            "/api/sessions/search", params={"profile": "default", "q": marker}
+        ).json()["results"]
+        worker_results = client.get(
+            "/api/sessions/search", params={"profile": "worker", "q": marker}
+        ).json()["results"]
+
+        assert {row["id"] for row in default_results} == {"default-search-result"}
+        assert {row["id"] for row in worker_results} == {"worker-search-result"}
+
+        missing = client.get(
+            "/api/sessions/search", params={"profile": "missing", "q": marker}
+        )
+        assert missing.status_code == 404
 
     def test_identical_session_ids_are_active_only_in_runtime_owner_profile(
         self, client, profiles_on_disk, monkeypatch
@@ -234,6 +277,93 @@ class TestSidebarScope:
 
 
 class TestCrossProfileProjectTree:
+
+    def test_merge_annotates_every_session_shape_after_shared_project_merge(self):
+        """Preview and hydrated lane rows retain their own profile activity."""
+        from hermes_cli.web_routers.profiles import _merge_profile_tree
+
+        def project_for(session_id):
+            def row():
+                return {"id": session_id, "is_active": False, "last_active": 1}
+
+            return {
+                "id": "project",
+                "path": "shared/path",
+                "isAuto": False,
+                "sessionCount": 1,
+                "totalTokens": 0,
+                "totalCostUsd": 0,
+                "lastActive": 1,
+                "previewSessions": [row()],
+                "repos": [
+                    {
+                        "id": "repo",
+                        "groups": [
+                            {"id": "lane", "sessionCount": 1, "sessions": [row()]}
+                        ],
+                    }
+                ],
+            }
+
+        session_id = "same-id"
+        merged = {}
+        owners = {("worker", session_id)}
+        _merge_profile_tree(merged, [project_for(session_id)], "default", 3, owners)
+        _merge_profile_tree(merged, [project_for(session_id)], "worker", 3, owners)
+
+        rows = _project_tree_session_rows({"projects": list(merged.values())})
+        by_profile = {}
+        for row in rows:
+            by_profile.setdefault(row["profile"], []).append(row)
+
+        assert {row["is_active"] for row in by_profile["default"]} == {False}
+        assert {row["is_active"] for row in by_profile["worker"]} == {True}
+        assert len(by_profile["default"]) == 2
+        assert len(by_profile["worker"]) == 2
+
+    def test_session_activity_uses_profile_qualified_runtime_ownership(
+        self, client, profiles_on_disk, tmp_path, monkeypatch
+    ):
+        """Identical persisted IDs cannot leak liveness between profiles."""
+        import tui_gateway.server as gateway_server
+
+        shared = tmp_path / "repos" / "shared"
+        shared.mkdir(parents=True)
+        session_id = "shared-project-tree-session"
+
+        from hermes_cli import projects_db
+
+        for home in profiles_on_disk.values():
+            _seed_session(home, session_id, source="cli", cwd=shared)
+            project = _seed_project(home, "Shared", shared)
+            with projects_db.connect_closing(db_path=home / "projects.db") as conn:
+                projects_db.set_active(conn, project)
+                assert projects_db.get_active_id(conn) == project
+
+        monkeypatch.setattr(gateway_server, "_sessions_lock", threading.RLock())
+        monkeypatch.setattr(
+            gateway_server,
+            "_sessions",
+            {
+                "runtime-owner": {
+                    "session_key": session_id,
+                    "profile_home": str(profiles_on_disk["worker"]),
+                    "running": True,
+                }
+            },
+        )
+
+        payload = client.get("/api/profiles/projects/tree").json()
+        rows = {
+            (row["profile"], row["id"]): row
+            for row in _project_tree_session_rows(payload)
+        }
+
+        assert rows[("default", session_id)]["is_active"] is False
+        assert rows[("worker", session_id)]["is_active"] is True
+        # ``active_id`` is an active-project selection. An all-profile tree has
+        # no authoritative scalar selection, independent of session activity.
+        assert payload["active_id"] is None
 
     def test_one_folder_worked_in_by_two_profiles_is_one_project(self, client, profiles_on_disk, tmp_path):
         # A folder is a folder no matter who opened it. Two profiles working the

@@ -570,6 +570,7 @@ def _merge_profile_tree(
     projects: List[Dict[str, Any]],
     profile: str,
     preview_limit: int,
+    running_session_ids: set[tuple[str, str]],
 ) -> None:
     """Fold one profile's projects into the shared tree, keyed by folder.
 
@@ -581,14 +582,20 @@ def _merge_profile_tree(
     is what the row badge and the profile filter read; a group header never
     claims a single owner.
     """
+    def annotate_session(session: Dict[str, Any]) -> None:
+        session["profile"] = profile
+        session["is_default_profile"] = profile == "default"
+        session["is_active"] = (
+            profile,
+            str(session.get("id") or ""),
+        ) in running_session_ids
+
     for project in projects:
         for lane in (repo for r in project.get("repos") or [] for repo in r.get("groups") or []):
             for session in lane.get("sessions") or []:
-                session["profile"] = profile
-                session["is_default_profile"] = profile == "default"
+                annotate_session(session)
         for session in project.get("previewSessions") or []:
-            session["profile"] = profile
-            session["is_default_profile"] = profile == "default"
+            annotate_session(session)
 
         key = project.get("path") or project["id"]
         existing = merged.get(key)
@@ -652,6 +659,7 @@ def get_profiles_projects_tree(preview_limit: int = 3, session_limit: int = 2000
     merged: Dict[str, Dict[str, Any]] = {}
     scoped_session_ids: List[str] = []
     errors: List[Dict[str, str]] = []
+    running_session_ids = _authoritative_running_session_ids()
 
     for name, home in targets:
         db_path = Path(home) / "state.db"
@@ -666,14 +674,20 @@ def get_profiles_projects_tree(preview_limit: int = 3, session_limit: int = 2000
 
         token = set_hermes_home_override(str(home))
         try:
-            tree, _active_id = gateway_server._build_project_tree(
+            tree, _profile_active_project_id = gateway_server._build_project_tree(
                 db,
                 preview_limit=preview_limit,
                 hydrate=False,
                 session_limit=session_limit,
                 include_discovered=False,
             )
-            _merge_profile_tree(merged, tree["projects"], name, preview_limit)
+            _merge_profile_tree(
+                merged,
+                tree["projects"],
+                name,
+                preview_limit,
+                running_session_ids,
+            )
             scoped_session_ids.extend(tree["scoped_session_ids"])
         except Exception as exc:
             _warn_profile_read_error(name, exc)
@@ -685,8 +699,9 @@ def get_profiles_projects_tree(preview_limit: int = 3, session_limit: int = 2000
     projects = sorted(merged.values(), key=lambda p: p.get("lastActive") or 0, reverse=True)
     return {
         "projects": projects,
-        # Ownership is per profile, so no single project is "the active one"
-        # here; the desktop only reads active_id to bias its overview sort.
+        # This is the active *project selection*, not session runtime state.
+        # Selection is profile-scoped, so an aggregate tree has no authoritative
+        # scalar active project; the desktop only uses it to bias overview sort.
         "active_id": None,
         "scoped_session_ids": scoped_session_ids,
         "errors": errors,
