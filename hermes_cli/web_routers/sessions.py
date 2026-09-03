@@ -19,6 +19,7 @@ import sqlite3
 import re
 import sys
 import time  # noqa: F401
+from pathlib import Path
 from typing import Any, Dict, List, Optional  # noqa: F401
 
 from fastapi import APIRouter, HTTPException, Query, Request  # noqa: F401
@@ -122,12 +123,14 @@ def _clean_search_excerpt(value: Any) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def _authoritative_running_session_ids() -> set[str]:
-    """Return persisted IDs that currently own a live gateway turn.
+def _authoritative_running_session_ids() -> set[tuple[str, str]]:
+    """Return ``(profile, persisted id)`` pairs owning a live gateway turn.
 
     Activity timestamps include tool and log writes, so they cannot establish
     that an agent turn is still running. If the runtime registry is unavailable,
     fail closed rather than reviving finished sessions from recent activity.
+    A runtime record's ``profile_home`` is authoritative; records without one
+    belong to the gateway's launch profile.
     """
     server = sys.modules.get("tui_gateway.server")
     sessions = getattr(server, "_sessions", None)
@@ -142,13 +145,25 @@ def _authoritative_running_session_ids() -> set[str]:
         _log.warning("Gateway runtime registry unavailable while listing sessions")
         return set()
 
-    return {
-        str(state["session_key"])
-        for state in snapshot
-        if isinstance(state, dict)
-        and state.get("running") is True
-        and state.get("session_key")
-    }
+    launch_profile = _cron_default_profile()
+    owners: set[tuple[str, str]] = set()
+    for state in snapshot:
+        if (
+            not isinstance(state, dict)
+            or state.get("running") is not True
+            or not state.get("session_key")
+        ):
+            continue
+        profile_home = state.get("profile_home")
+        if profile_home:
+            from gateway.status import _profile_name_for_home
+
+            profile_name = _profile_name_for_home(Path(str(profile_home))) or "default"
+        else:
+            profile_name = launch_profile
+        if profile_name:
+            owners.add((profile_name, str(state["session_key"])))
+    return owners
 
 
 @list_router.get("/api/sessions")
@@ -241,15 +256,10 @@ def get_sessions(
                 exclude_children=True,
             )
             running_session_ids = _authoritative_running_session_ids()
-            # Runtime ownership belongs to this serving profile. An identically
-            # named session in another profile must never inherit its green state.
             current_profile = _cron_default_profile()
             row_profile = profile_name or current_profile
             for s in sessions:
-                s["is_active"] = (
-                    row_profile == current_profile
-                    and str(s.get("id")) in running_session_ids
-                )
+                s["is_active"] = (row_profile, str(s.get("id"))) in running_session_ids
                 s["profile"] = row_profile
                 s["is_default_profile"] = row_profile == "default"
                 # SQLite stores the flag as 0/1; expose a real JSON boolean.
@@ -301,9 +311,8 @@ async def search_sessions(
             include_sources = [source_filter] if source_filter else (source_list or None)
             exclude_list = [s.strip() for s in (exclude_sources or "").split(",") if s.strip()]
             running_session_ids = _authoritative_running_session_ids()
-            current_profile = _cron_default_profile()
             result_profile = (
-                _cron_profile_home(profile)[0] if profile else current_profile
+                _cron_profile_home(profile)[0] if profile else _cron_default_profile()
             )
 
             # Walk parent_session_id to the compression root, memoized so a
@@ -408,9 +417,9 @@ async def search_sessions(
                             "ended_at": row.get("ended_at"),
                             "last_active": row.get("last_active") or row.get("started_at"),
                             "is_active": (
-                                result_profile == current_profile
-                                and str(row.get("id") or sid) in running_session_ids
-                            ),
+                                result_profile,
+                                str(row.get("id") or sid),
+                            ) in running_session_ids,
                             "message_count": row.get("message_count") or 0,
                             "tool_call_count": row.get("tool_call_count") or 0,
                             "input_tokens": row.get("input_tokens") or 0,

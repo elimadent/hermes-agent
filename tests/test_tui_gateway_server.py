@@ -3234,6 +3234,109 @@ def test_session_resume_uses_parent_lineage_for_display(monkeypatch, omit_messag
         (target, True, False),
     ]
     assert captured["history_calls"] == expected_calls
+    assert resp["result"]["history_before_cursor"] is None
+
+
+def test_session_resume_omit_messages_carries_profile_scoped_history_cursor(
+    monkeypatch, tmp_path
+):
+    from gateway.platforms.api_server import _decode_history_cursor
+    from hermes_state import SessionDB
+
+    profile_home = tmp_path / "profiles" / "worker"
+    profile_home.mkdir(parents=True)
+    db = SessionDB(db_path=profile_home / "state.db")
+    target = "cursor-session"
+    db.create_session(target, source="tui")
+    db.append_message(target, role="user", content="first")
+    db.append_message(target, role="assistant", content="second")
+    identity = db.history_cursor_identity()
+
+    monkeypatch.setattr(
+        server, "_profile_home", lambda profile: profile_home if profile == "worker" else None
+    )
+    monkeypatch.setattr("hermes_state.get_shared_session_db", lambda db_path=None: db)
+    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
+    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: None)
+
+    try:
+        response = server.handle_request(
+            {
+                "id": "cursor-1",
+                "method": "session.resume",
+                "params": {
+                    "session_id": target,
+                    "profile": "worker",
+                    "omit_messages": True,
+                },
+            }
+        )
+        assert "error" not in response, response
+        token = response["result"]["history_before_cursor"]
+        assert token is not None
+        cursor = _decode_history_cursor(token, identity["signing_key"])
+        assert cursor["session"] == target
+        assert cursor["profile"] == "worker"
+        assert cursor["store"] == identity["store_uuid"]
+        assert cursor["direction"] == "older"
+        assert cursor["view"] == "compacted_display_v1"
+
+        # A second resume takes the live fast path and must retain the same
+        # profile-scoped cursor contract used by the normal cold path.
+        live = server.handle_request(
+            {
+                "id": "cursor-2",
+                "method": "session.resume",
+                "params": {
+                    "session_id": target,
+                    "profile": "worker",
+                    "omit_messages": True,
+                },
+            }
+        )
+        assert live["result"]["history_before_cursor"] is not None
+        live_cursor = _decode_history_cursor(
+            live["result"]["history_before_cursor"], identity["signing_key"]
+        )
+        assert live_cursor["profile"] == "worker"
+        assert live_cursor["store"] == identity["store_uuid"]
+    finally:
+        server._sessions.clear()
+
+
+def test_runtime_profile_home_uses_canonical_default_and_named_profiles(tmp_path):
+    root = tmp_path / "hermes"
+    worker = root / "profiles" / "worker"
+    worker.mkdir(parents=True)
+
+    assert server._profile_name_for_runtime_home(root) == "default"
+    assert server._profile_name_for_runtime_home(worker) == "worker"
+
+
+def test_session_resume_empty_history_returns_terminal_null_cursor(monkeypatch, tmp_path):
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    target = "empty-cursor-session"
+    db.create_session(target, source="tui")
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
+    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: None)
+
+    try:
+        response = server.handle_request(
+            {
+                "id": "cursor-empty",
+                "method": "session.resume",
+                "params": {"session_id": target, "omit_messages": True},
+            }
+        )
+        assert "error" not in response, response
+        assert "history_before_cursor" in response["result"]
+        assert response["result"]["history_before_cursor"] is None
+    finally:
+        server._sessions.clear()
+        db.close()
 
 
 def test_live_visible_history_prefers_db_display_with_candidate():
@@ -3525,6 +3628,7 @@ def test_lazy_child_watch_resume_serves_candidate_inclusive_display(monkeypatch,
     texts = [m.get("text") for m in resp["result"]["messages"]]
     assert "child substantive answer" in texts
     assert texts == ["child prompt", "child substantive answer", "child terse reply"]
+    assert resp["result"]["history_before_cursor"] is None
 
 
 def test_session_resume_deferred_history_acknowledges_and_reuses(monkeypatch):
@@ -3585,6 +3689,7 @@ def test_session_resume_deferred_history_acknowledges_and_reuses(monkeypatch):
         assert first["result"]["hydrating"] is True
         assert first["result"]["messages"] == []
         assert first["result"]["message_count"] == 1200
+        assert first["result"]["history_before_cursor"] is None
         assert history_started.wait(timeout=1.0)
 
         second = server._methods["session.resume"](
@@ -3594,6 +3699,7 @@ def test_session_resume_deferred_history_acknowledges_and_reuses(monkeypatch):
         assert second["result"]["session_id"] == first["result"]["session_id"]
         assert second["result"]["hydrating"] is True
         assert second["result"]["messages"] == []
+        assert second["result"]["history_before_cursor"] is None
 
         release_history.set()
         sid = first["result"]["session_id"]
@@ -3667,6 +3773,9 @@ def test_session_resume_deferred_history_failure_can_retry(monkeypatch):
         )
         first_sid = first["result"]["session_id"]
         assert first_released.wait(timeout=1.0)
+        deadline = time.time() + 1.0
+        while first_sid in server._sessions and time.time() < deadline:
+            time.sleep(0.01)
         assert first_sid not in server._sessions
 
         second = server._methods["session.resume"](
@@ -3973,6 +4082,7 @@ def test_session_resume_profile_uses_profile_db_cwd(monkeypatch, tmp_path):
         assert captured["agent_db"] is profile_db
         assert server._sessions[sid]["cwd"] == str(profile_cwd)
         assert resp["result"]["info"]["cwd"] == str(profile_cwd)
+        assert resp["result"]["history_before_cursor"] is None
         assert "launch_update" not in captured
     finally:
         server._sessions.clear()
@@ -5622,6 +5732,7 @@ def test_lazy_unpersisted_resume_rebinds_transport_and_cancels_reap(monkeypatch)
         )
 
         assert resp is not None and resp["result"]["session_id"] == "lazy-sid"
+        assert resp["result"]["history_before_cursor"] is None
         assert session["transport"] is live_transport
         assert "lazy-sid" not in server._pending_ws_reaps
         assert len(cancelled) == 1

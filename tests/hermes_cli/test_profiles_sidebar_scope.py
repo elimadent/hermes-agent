@@ -11,6 +11,8 @@ Two behaviors that only show up with more than one profile on disk:
   coexist in one list.
 """
 
+import threading
+
 import pytest
 
 
@@ -96,6 +98,107 @@ def _slice_ids(payload, slice_name):
 
 
 class TestSidebarScope:
+
+    def test_identical_session_ids_are_active_only_in_runtime_owner_profile(
+        self, client, profiles_on_disk, monkeypatch
+    ):
+        """All list surfaces bind liveness to (profile home, stored id)."""
+        import tui_gateway.server as gateway_server
+        from hermes_cli.web_routers import profiles as profiles_router
+        from hermes_state import SessionDB
+
+        session_id = "shared-session-id"
+        marker = "profile-scoped-authoritative-owner"
+        for home in profiles_on_disk.values():
+            db = SessionDB(db_path=home / "state.db")
+            try:
+                db.create_session(session_id, source="cli")
+                db.append_message(session_id, role="user", content=marker)
+            finally:
+                db.close()
+
+        monkeypatch.setattr(gateway_server, "_sessions_lock", threading.RLock())
+        monkeypatch.setattr(
+            gateway_server,
+            "_sessions",
+            {
+                "runtime-owner": {
+                    "session_key": session_id,
+                    "profile_home": str(profiles_on_disk["worker"]),
+                    "running": True,
+                }
+            },
+        )
+        profiles_router.get_profiles_sessions_sidebar.cache_clear()
+
+        default_list = client.get("/api/sessions", params={"profile": "default"}).json()
+        worker_list = client.get("/api/sessions", params={"profile": "worker"}).json()
+        assert default_list["sessions"][0]["is_active"] is False
+        assert worker_list["sessions"][0]["is_active"] is True
+
+        default_search = client.get(
+            "/api/sessions/search", params={"profile": "default", "q": marker}
+        ).json()
+        worker_search = client.get(
+            "/api/sessions/search", params={"profile": "worker", "q": marker}
+        ).json()
+        assert default_search["results"][0]["is_active"] is False
+        assert worker_search["results"][0]["is_active"] is True
+
+        aggregate = client.get("/api/profiles/sessions", params={"profile": "all"}).json()
+        aggregate_rows = {
+            (row["profile"], row["id"]): row for row in aggregate["sessions"]
+        }
+        assert aggregate_rows[("default", session_id)]["is_active"] is False
+        assert aggregate_rows[("worker", session_id)]["is_active"] is True
+
+        sidebar = client.get(
+            "/api/profiles/sessions/sidebar", params={"recents_profile": "all"}
+        ).json()
+        sidebar_rows = {
+            (row["profile"], row["id"]): row
+            for row in sidebar["recents"]["sessions"]
+        }
+        assert sidebar_rows[("default", session_id)]["is_active"] is False
+        assert sidebar_rows[("worker", session_id)]["is_active"] is True
+
+        # The root HERMES_HOME is canonically "default", never its directory
+        # basename (for example "hermes" or a test-specific temp directory).
+        gateway_server._sessions["runtime-owner"]["profile_home"] = str(
+            profiles_on_disk["default"]
+        )
+        profiles_router.get_profiles_sessions_sidebar.cache_clear()
+
+        default_list = client.get("/api/sessions", params={"profile": "default"}).json()
+        worker_list = client.get("/api/sessions", params={"profile": "worker"}).json()
+        assert default_list["sessions"][0]["is_active"] is True
+        assert worker_list["sessions"][0]["is_active"] is False
+
+        default_search = client.get(
+            "/api/sessions/search", params={"profile": "default", "q": marker}
+        ).json()
+        worker_search = client.get(
+            "/api/sessions/search", params={"profile": "worker", "q": marker}
+        ).json()
+        assert default_search["results"][0]["is_active"] is True
+        assert worker_search["results"][0]["is_active"] is False
+
+        aggregate = client.get("/api/profiles/sessions", params={"profile": "all"}).json()
+        aggregate_rows = {
+            (row["profile"], row["id"]): row for row in aggregate["sessions"]
+        }
+        assert aggregate_rows[("default", session_id)]["is_active"] is True
+        assert aggregate_rows[("worker", session_id)]["is_active"] is False
+
+        sidebar = client.get(
+            "/api/profiles/sessions/sidebar", params={"recents_profile": "all"}
+        ).json()
+        sidebar_rows = {
+            (row["profile"], row["id"]): row
+            for row in sidebar["recents"]["sessions"]
+        }
+        assert sidebar_rows[("default", session_id)]["is_active"] is True
+        assert sidebar_rows[("worker", session_id)]["is_active"] is False
 
     def test_concrete_profile_sees_only_its_own_slices(self, client, profiles_on_disk):
         _seed_session(profiles_on_disk["default"], "default-chat", source="cli")

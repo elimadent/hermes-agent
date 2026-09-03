@@ -290,7 +290,6 @@ def get_profiles_sessions(
     profile_totals: Dict[str, int] = {}
     errors: List[Dict[str, str]] = []
     running_session_ids = _authoritative_running_session_ids()
-    current_profile = _cron_default_profile()
     for name, home in targets:
         db_path = Path(home) / "state.db"
         if not db_path.exists():
@@ -338,10 +337,7 @@ def get_profiles_sessions(
             for s in rows:
                 s["profile"] = name
                 s["is_default_profile"] = name == "default"
-                s["is_active"] = (
-                    name == current_profile
-                    and str(s.get("id")) in running_session_ids
-                )
+                s["is_active"] = (name, str(s.get("id"))) in running_session_ids
                 s["archived"] = bool(s.get("archived"))
                 s["pinned"] = bool(s.get("pinned"))
                 merged.append(s)
@@ -430,16 +426,12 @@ def get_profiles_sessions_sidebar(
     profile_totals: Dict[str, Dict[str, float]] = {}
     errors: List[Dict[str, str]] = []
     running_session_ids = _authoritative_running_session_ids()
-    current_profile = _cron_default_profile()
 
     def _tag(rows: List[Dict[str, Any]], name: str) -> List[Dict[str, Any]]:
         for s in rows:
             s["profile"] = name
             s["is_default_profile"] = name == "default"
-            s["is_active"] = (
-                name == current_profile
-                and str(s.get("id")) in running_session_ids
-            )
+            s["is_active"] = (name, str(s.get("id"))) in running_session_ids
             s["archived"] = bool(s.get("archived"))
             # SQLite stores the pin as 0/1; the sidebar needs a real boolean to
             # render the Pinned section from server state.

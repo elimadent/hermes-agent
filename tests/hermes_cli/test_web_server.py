@@ -520,6 +520,9 @@ class TestWebServerEndpoints:
         }
         assert sidebar_rows["surface-running"]["is_active"] is True
         assert sidebar_rows["surface-idle"]["is_active"] is False
+        # The sidebar response is cached; never leak this test's isolated
+        # store into the next test after monkeypatch restores HERMES_HOME.
+        profiles_router.get_profiles_sessions_sidebar.cache_clear()
 
     @pytest.mark.parametrize(
         "missing_column", ["archived", "pinned", "last_activity_at"]

@@ -490,6 +490,7 @@ def _(rid, params: dict) -> dict:
                                     "lazy": True,
                                     "profile_name": profile or "",
                                 },
+                                "history_before_cursor": None,
                             },
                             live,
                         ),
@@ -613,9 +614,30 @@ def _(rid, params: dict) -> dict:
                 target, exc,
             )
 
+        # Promote/validate cursor identity before any response history read so
+        # legacy rows receive history_seq provenance in the hydrated payload.
+        # Failure is non-fatal and becomes an explicit terminal null cursor.
+        try:
+            resume_history_capability = db.ensure_history_cursor_capability(target)
+        except Exception:
+            resume_history_capability = None
+
         profile_resume_cwd = str(found.get("cwd") or "").strip() or _profile_configured_cwd(
             profile_home
         )
+
+        def _with_resume_cursor(payload: dict, runtime_session: dict | None = None) -> dict:
+            cursor_profile = _response_profile_name(profile)
+            runtime_home = (runtime_session or {}).get("profile_home")
+            if runtime_home:
+                cursor_profile = _profile_name_for_runtime_home(runtime_home)
+            return _attach_history_before_cursor(
+                payload,
+                db=db,
+                stored_id=target,
+                profile_name=cursor_profile,
+                capability=resume_history_capability,
+            )
 
         def _reuse_live_payload(sid: str, session: dict) -> dict:
             payload = _live_session_payload(
@@ -639,7 +661,7 @@ def _(rid, params: dict) -> dict:
             if session.get("agent") is None and _child_run_active(target):
                 payload["running"] = True
                 payload["status"] = "streaming"
-            return payload
+            return _with_resume_cursor(payload, session)
 
         def _reuse_live_response(sid: str, session: dict) -> dict:
             # The helper owns the resume lock because slow-path claim races can
@@ -724,25 +746,23 @@ def _(rid, params: dict) -> dict:
                 logger.debug("child-watch display projection read failed", exc_info=True)
                 display_history = history
             messages = [] if omit_messages else _history_to_messages(display_history)
-            return _ok(
-                rid,
-                _attach_todo_state(
-                    {
-                        "session_id": sid,
-                        "resumed": target,
-                        "message_count": len(display_history) if omit_messages else len(messages),
-                        "messages": messages,
-                        "messages_omitted": omit_messages,
-                        "info": _lazy_resume_info(cwd, profile=profile),
-                        "inflight": None,
-                        "running": child_running,
-                        "session_key": target,
-                        "started_at": record["created_at"],
-                        "status": "streaming" if child_running else "idle",
-                    },
-                    record,
-                ),
+            payload = _attach_todo_state(
+                {
+                    "session_id": sid,
+                    "resumed": target,
+                    "message_count": len(display_history) if omit_messages else len(messages),
+                    "messages": messages,
+                    "messages_omitted": omit_messages,
+                    "info": _lazy_resume_info(cwd, profile=profile),
+                    "inflight": None,
+                    "running": child_running,
+                    "session_key": target,
+                    "started_at": record["created_at"],
+                    "status": "streaming" if child_running else "idle",
+                },
+                record,
             )
+            return _ok(rid, _with_resume_cursor(payload, record))
 
         # Desktop can ask for a bounded acknowledgement and hydrate the display
         # transcript through the paginated REST endpoint. Register the runtime now,
@@ -783,14 +803,7 @@ def _(rid, params: dict) -> dict:
             if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
                 return _reuse_live_response(*live)
 
-            _schedule_resume_hydration(sid, target, db, close_db=owns_db)
-            # The hydration worker now owns a profile-scoped handle and closes it
-            # after the transcript read. The shared launch DB is process-owned.
-            if owns_db:
-                owns_db = False
-            _schedule_session_cap_enforcement()
-            return _ok(
-                rid,
+            payload = _with_resume_cursor(
                 _attach_todo_state(
                     {
                         "session_id": sid,
@@ -812,7 +825,15 @@ def _(rid, params: dict) -> dict:
                     },
                     record,
                 ),
+                record,
             )
+            _schedule_resume_hydration(sid, target, db, close_db=owns_db)
+            # The hydration worker now owns a profile-scoped handle and closes it
+            # after the transcript read. The shared launch DB is process-owned.
+            if owns_db:
+                owns_db = False
+            _schedule_session_cap_enforcement()
+            return _ok(rid, payload)
 
         # Cold resume default: register the live session and read its stored
         # transcript, but build the agent OFF the response path. _make_agent can
@@ -906,7 +927,7 @@ def _(rid, params: dict) -> dict:
             }
             if auto_continue is not None:
                 payload["auto_continue"] = auto_continue
-            return _ok(rid, _attach_todo_state(payload, record))
+            return _ok(rid, _with_resume_cursor(_attach_todo_state(payload, record), record))
 
         # Build the agent OUTSIDE the lock — _make_agent can block for seconds
         # (MCP discovery, prompt/skill build, AIAgent construction). Holding
@@ -1113,7 +1134,7 @@ def _(rid, params: dict) -> dict:
     }
     if auto_continue is not None:
         payload["auto_continue"] = auto_continue
-    return _ok(rid, _attach_todo_state(payload, session))
+    return _ok(rid, _with_resume_cursor(_attach_todo_state(payload, session), session))
 
 
 @method("session.cwd.set")
@@ -1294,55 +1315,19 @@ def _(rid, params: dict) -> dict:
         or session.get("session_key")
         or ""
     )
-    if stored_id:
-        try:
-            from gateway.platforms.api_server import _encode_history_cursor
-
-            with _session_db(session) as db:
-                capability = (
-                    preflight_capability
-                    if stored_id == preflight_stored_id
-                    else db.ensure_history_cursor_capability(stored_id)
-                )
-                if capability is None:
-                    capability = db.ensure_history_cursor_capability(stored_id)
-                if capability.get("status") != "available":
-                    payload["history_before_cursor"] = None
-                    return _ok(rid, payload)
-                payload["history_before_cursor"] = None
-                hydrated_messages = payload.get("messages") or []
-                hydrated_boundary = _activation_history_boundary(hydrated_messages, [])
-                page = db.get_history_cursor_page(
-                    stored_id,
-                    before_seq=hydrated_boundary,
-                    limit=1,
-                )
-                boundary = (
-                    hydrated_boundary
-                    if hydrated_boundary is not None
-                    else _activation_history_boundary([], page.get("messages") or [])
-                )
-                if page.get("messages") and boundary is not None:
-                    identity = db.history_cursor_identity()
-                    payload["history_before_cursor"] = _encode_history_cursor(
-                        {
-                            "v": 1,
-                            "session": stored_id,
-                            "profile": (
-                                Path(session["profile_home"]).name
-                                if session.get("profile_home")
-                                else _current_profile_name()
-                            ),
-                            "store": identity["store_uuid"],
-                            "cursor_epoch": capability["cursor_epoch"],
-                            "before_seq": int(boundary),
-                            "view": "compacted_display_v1",
-                            "direction": "older",
-                        },
-                        identity["signing_key"],
-                    )
-        except Exception:
-            payload["history_before_cursor"] = None
+    with _session_db(session) as db:
+        capability = preflight_capability if stored_id == preflight_stored_id else None
+        payload = _attach_history_before_cursor(
+            payload,
+            db=db,
+            stored_id=stored_id,
+            profile_name=(
+                _profile_name_for_runtime_home(session["profile_home"])
+                if session.get("profile_home")
+                else _current_profile_name()
+            ),
+            capability=capability,
+        )
     return _ok(rid, payload)
 
 

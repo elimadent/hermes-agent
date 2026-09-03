@@ -9660,6 +9660,71 @@ def _activation_history_boundary(messages: list[dict], newest_page: list[dict]) 
     return newest + 1
 
 
+def _attach_history_before_cursor(
+    payload: dict,
+    *,
+    db,
+    stored_id: str,
+    profile_name: str,
+    capability: dict | None = None,
+) -> dict:
+    """Attach a fail-closed immutable-history cursor to an attach payload.
+
+    ``None`` is terminal: the stored row has no older display history, cursor
+    identity could not be established, or the store cannot support immutable
+    pagination. Callers may pass a capability obtained before hydrating their
+    messages so newly promoted legacy rows carry ``history_seq`` provenance.
+    """
+    payload["history_before_cursor"] = None
+    if db is None or not stored_id:
+        return payload
+    try:
+        from gateway.platforms.api_server import _encode_history_cursor
+
+        resolved_capability = capability or db.ensure_history_cursor_capability(stored_id)
+        if resolved_capability.get("status") != "available":
+            return payload
+        hydrated_boundary = _activation_history_boundary(payload.get("messages") or [], [])
+        page = db.get_history_cursor_page(
+            stored_id,
+            before_seq=hydrated_boundary,
+            limit=1,
+        )
+        boundary = (
+            hydrated_boundary
+            if hydrated_boundary is not None
+            else _activation_history_boundary([], page.get("messages") or [])
+        )
+        if not page.get("messages") or boundary is None:
+            return payload
+        identity = db.history_cursor_identity()
+        payload["history_before_cursor"] = _encode_history_cursor(
+            {
+                "v": 1,
+                "session": stored_id,
+                "profile": profile_name,
+                "store": identity["store_uuid"],
+                "cursor_epoch": resolved_capability["cursor_epoch"],
+                "before_seq": int(boundary),
+                "view": "compacted_display_v1",
+                "direction": "older",
+            },
+            identity["signing_key"],
+        )
+    except Exception:
+        payload["history_before_cursor"] = None
+    return payload
+
+
+def _profile_name_for_runtime_home(profile_home: str | Path | None) -> str:
+    """Map a runtime HERMES_HOME to its canonical API profile name."""
+    if not profile_home:
+        return _current_profile_name()
+    from gateway.status import _profile_name_for_home
+
+    return _profile_name_for_home(Path(profile_home)) or "default"
+
+
 def _history_to_messages(history: list[dict]) -> list[dict]:
     messages = []
     tool_call_args = {}
