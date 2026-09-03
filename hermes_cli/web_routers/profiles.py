@@ -30,6 +30,7 @@ from typing import Any, Dict, List, Optional, Tuple  # noqa: F401
 from fastapi import APIRouter, HTTPException, Query  # noqa: F401
 
 from hermes_cli.web_deps import late
+from hermes_cli.web_routers.sessions import _authoritative_running_session_ids
 from hermes_cli.web_models import (
     ProfileCreate,
     ProfileActiveUpdate,
@@ -71,6 +72,7 @@ router = APIRouter()
 # Late-bound web_server helpers (resolved at call time; cycle-safe,
 # monkeypatch-transparent).
 _cron_profile_home = late("_cron_profile_home")
+_cron_default_profile = late("_cron_default_profile")
 _disable_unselected_skills = late("_disable_unselected_skills")
 _fallback_profile_dicts = late("_fallback_profile_dicts")
 _hub_action_name = late("_hub_action_name")
@@ -287,7 +289,8 @@ def get_profiles_sessions(
     total = 0
     profile_totals: Dict[str, int] = {}
     errors: List[Dict[str, str]] = []
-    now = time.time()
+    running_session_ids = _authoritative_running_session_ids()
+    current_profile = _cron_default_profile()
     for name, home in targets:
         db_path = Path(home) / "state.db"
         if not db_path.exists():
@@ -336,8 +339,8 @@ def get_profiles_sessions(
                 s["profile"] = name
                 s["is_default_profile"] = name == "default"
                 s["is_active"] = (
-                    s.get("ended_at") is None
-                    and (now - s.get("last_active", s.get("started_at", 0))) < 300
+                    name == current_profile
+                    and str(s.get("id")) in running_session_ids
                 )
                 s["archived"] = bool(s.get("archived"))
                 s["pinned"] = bool(s.get("pinned"))
@@ -386,7 +389,7 @@ def get_profiles_sessions_sidebar(
     profile's ``state.db`` three times and re-counted each refresh. This opens
     each DB once and runs the three filtered queries together, returning the
     three windows in one payload. Read-only and process-light, same row
-    projection and 300s active heuristic as ``/api/profiles/sessions``.
+    projection and authoritative live-turn state as ``/api/profiles/sessions``.
 
     ``recents_profile`` scopes the whole payload, not just recents. Cron and
     messaging used to come back cross-profile unconditionally, which is what
@@ -426,15 +429,16 @@ def get_profiles_sessions_sidebar(
     recents_truncated: Dict[str, bool] = {}
     profile_totals: Dict[str, Dict[str, float]] = {}
     errors: List[Dict[str, str]] = []
-    now = time.time()
+    running_session_ids = _authoritative_running_session_ids()
+    current_profile = _cron_default_profile()
 
     def _tag(rows: List[Dict[str, Any]], name: str) -> List[Dict[str, Any]]:
         for s in rows:
             s["profile"] = name
             s["is_default_profile"] = name == "default"
             s["is_active"] = (
-                s.get("ended_at") is None
-                and (now - s.get("last_active", s.get("started_at", 0))) < 300
+                name == current_profile
+                and str(s.get("id")) in running_session_ids
             )
             s["archived"] = bool(s.get("archived"))
             # SQLite stores the pin as 0/1; the sidebar needs a real boolean to

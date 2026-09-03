@@ -457,6 +457,70 @@ class TestWebServerEndpoints:
         assert rows["actually-running"]["is_active"] is True
         assert rows["recent-but-finished"]["is_active"] is False
 
+    def test_all_session_list_surfaces_use_authoritative_live_turns(self, monkeypatch):
+        """Search and profile sidebars must not revive idle rows from timestamps."""
+        from hermes_constants import get_hermes_home
+        from hermes_state import SessionDB
+        from hermes_cli.web_routers import profiles as profiles_router
+
+        db = SessionDB(db_path=get_hermes_home() / "state.db")
+        try:
+            db.create_session("surface-running", source="api_server")
+            db.create_session("surface-idle", source="api_server")
+            for sid in ("surface-running", "surface-idle"):
+                db.append_message(
+                    sid,
+                    role="user",
+                    content=f"authoritative-surface-marker {sid}",
+                )
+        finally:
+            db.close()
+
+        fake_server = SimpleNamespace(
+            _sessions_lock=threading.RLock(),
+            _sessions={
+                "live-turn": {
+                    "session_key": "surface-running",
+                    "running": True,
+                }
+            },
+            _methods={},
+            _cfg_cache=None,
+            _cfg_mtime=None,
+            _cfg_path=None,
+            _db=None,
+            _db_error=None,
+            _real_stdout=None,
+        )
+        fake_server._close_session_by_id = (
+            lambda sid, end_reason=None: fake_server._sessions.pop(sid, None)
+        )
+        monkeypatch.setitem(sys.modules, "tui_gateway.server", fake_server)
+        profiles_router.get_profiles_sessions_sidebar.cache_clear()
+
+        search = self.client.get(
+            "/api/sessions/search",
+            params={"q": "authoritative-surface-marker", "limit": 20},
+        )
+        assert search.status_code == 200
+        search_rows = {row["id"]: row for row in search.json()["results"]}
+        assert search_rows["surface-running"]["is_active"] is True
+        assert search_rows["surface-idle"]["is_active"] is False
+
+        profiles = self.client.get("/api/profiles/sessions?limit=50&offset=0")
+        assert profiles.status_code == 200
+        profile_rows = {row["id"]: row for row in profiles.json()["sessions"]}
+        assert profile_rows["surface-running"]["is_active"] is True
+        assert profile_rows["surface-idle"]["is_active"] is False
+
+        sidebar = self.client.get("/api/profiles/sessions/sidebar")
+        assert sidebar.status_code == 200
+        sidebar_rows = {
+            row["id"]: row for row in sidebar.json()["recents"]["sessions"]
+        }
+        assert sidebar_rows["surface-running"]["is_active"] is True
+        assert sidebar_rows["surface-idle"]["is_active"] is False
+
     @pytest.mark.parametrize(
         "missing_column", ["archived", "pinned", "last_activity_at"]
     )

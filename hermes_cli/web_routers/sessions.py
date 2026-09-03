@@ -241,12 +241,15 @@ def get_sessions(
                 exclude_children=True,
             )
             running_session_ids = _authoritative_running_session_ids()
-            # Same ownership contract as get_session_detail: rows are stamped
-            # with the serving profile even when the request wasn't explicitly
-            # scoped, so default-profile rows never circulate unowned.
-            row_profile = profile_name or _cron_default_profile()
+            # Runtime ownership belongs to this serving profile. An identically
+            # named session in another profile must never inherit its green state.
+            current_profile = _cron_default_profile()
+            row_profile = profile_name or current_profile
             for s in sessions:
-                s["is_active"] = str(s.get("id")) in running_session_ids
+                s["is_active"] = (
+                    row_profile == current_profile
+                    and str(s.get("id")) in running_session_ids
+                )
                 s["profile"] = row_profile
                 s["is_default_profile"] = row_profile == "default"
                 # SQLite stores the flag as 0/1; expose a real JSON boolean.
@@ -297,7 +300,11 @@ async def search_sessions(
             source_list = [s.strip() for s in (sources or "").split(",") if s.strip()]
             include_sources = [source_filter] if source_filter else (source_list or None)
             exclude_list = [s.strip() for s in (exclude_sources or "").split(",") if s.strip()]
-            now = time.time()
+            running_session_ids = _authoritative_running_session_ids()
+            current_profile = _cron_default_profile()
+            result_profile = (
+                _cron_profile_home(profile)[0] if profile else current_profile
+            )
 
             # Walk parent_session_id to the compression root, memoized so a
             # chain of compression segments only costs one walk. We deliberately
@@ -401,8 +408,8 @@ async def search_sessions(
                             "ended_at": row.get("ended_at"),
                             "last_active": row.get("last_active") or row.get("started_at"),
                             "is_active": (
-                                row.get("ended_at") is None
-                                and (now - (row.get("last_active") or row.get("started_at") or 0)) < 300
+                                result_profile == current_profile
+                                and str(row.get("id") or sid) in running_session_ids
                             ),
                             "message_count": row.get("message_count") or 0,
                             "tool_call_count": row.get("tool_call_count") or 0,
