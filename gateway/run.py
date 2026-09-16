@@ -5303,11 +5303,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     def _update_runtime_status(self, gateway_state: Optional[str] = None, exit_reason: Optional[str] = None) -> None:
         try:
             from gateway.status import write_runtime_status
+            # Republish the in-flight session ids on every lifecycle
+            # transition too. At startup that set is EMPTY, which is what
+            # clears a stale "working" marker left behind by a gateway that
+            # was hard-killed mid-turn — no turn survives a restart.
+            _leases = getattr(self, "_turn_leases", None)
+            _ids = _leases.held_session_ids() if _leases is not None else []
             write_runtime_status(
                 gateway_state=gateway_state,
                 exit_reason=exit_reason,
                 restart_requested=self._restart_requested,
                 active_agents=self._active_work_count(),
+                active_session_ids=_ids,
             )
         except Exception:
             pass
@@ -5330,7 +5337,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         try:
             from gateway.status import write_runtime_status
-            write_runtime_status(active_agents=self._active_work_count())
+            # Also publish WHICH sessions are mid-turn, not just how many.
+            # `/api/sessions` had no way to answer "is this row working?" and
+            # fell back to message recency, which goes stale during a long
+            # model call — so a working session read as idle. The turn-lease
+            # registry is keyed by RESOLVED session_id (the id REST lists),
+            # which is why it is the source here and `_running_agents` (keyed
+            # by routing key, many-to-one onto session_id) is not.
+            _leases = getattr(self, "_turn_leases", None)
+            _ids = _leases.held_session_ids() if _leases is not None else []
+            write_runtime_status(
+                active_agents=self._active_work_count(),
+                active_session_ids=_ids,
+            )
         except Exception:
             pass
 
@@ -13609,6 +13628,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if not hasattr(self, "_turn_lease_tokens"):
                     self._turn_lease_tokens = {}
                 self._turn_lease_tokens[(_quick_key, run_generation)] = _lease_token
+                # Turn boundary: this session is now mid-turn. Publish it so
+                # the session list can show it as working for the WHOLE turn,
+                # not just while it happens to be writing transcript rows.
+                # The running-agent-slot boundary writes fire before this
+                # point, so without this call a long turn is never reported.
+                self._persist_active_agents()
 
         # Load conversation history from transcript
         history = await self.async_session_store.load_transcript(session_entry.session_id)
@@ -19484,10 +19509,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if token is None:
             return False
         try:
-            return registry.release(token)
+            released = registry.release(token)
         except Exception:
             logger.debug("Failed to release turn lease", exc_info=True)
             return False
+        if released:
+            # The sibling write in _release_running_agent_state runs BEFORE
+            # this release, so it still sees the lease held. Re-publish here
+            # or the session stays "working" until the next boundary event.
+            self._persist_active_agents()
+        return released
 
     def _rebind_turn_lease(
         self, session_key: str, run_generation: int, new_session_id: str
