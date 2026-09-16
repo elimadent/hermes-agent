@@ -1760,11 +1760,10 @@ def _count_status_active_sessions() -> int:
     try:
         sessions = db.list_sessions_rich(limit=50, compact_rows=True)
         now = time.time()
-        return sum(
-            1 for s in sessions
-            if s.get("ended_at") is None
-            and (now - s.get("last_active", s.get("started_at", 0))) < 300
-        )
+        # Same rule as the session list, from the same helper — this count and
+        # the rows it counts must never disagree about what "active" means.
+        running = _running_session_ids()
+        return sum(1 for s in sessions if _session_is_active(s, now, running))
     finally:
         db.close()
 
@@ -4986,11 +4985,9 @@ def get_sessions(
                 exclude_children=True,
             )
             now = time.time()
+            _running = _running_session_ids(profile_name)
             for s in sessions:
-                s["is_active"] = (
-                    s.get("ended_at") is None
-                    and (now - s.get("last_active", s.get("started_at", 0))) < 300
-                )
+                s["is_active"] = _session_is_active(s, now, _running)
                 if profile_name:
                     s["profile"] = profile_name
                     s["is_default_profile"] = profile_name == "default"
@@ -5110,13 +5107,11 @@ def get_profiles_sessions(
             )
             total += profile_total
             profile_totals[name] = profile_total
+            _running = _running_session_ids(name)
             for s in rows:
                 s["profile"] = name
                 s["is_default_profile"] = name == "default"
-                s["is_active"] = (
-                    s.get("ended_at") is None
-                    and (now - s.get("last_active", s.get("started_at", 0))) < 300
-                )
+                s["is_active"] = _session_is_active(s, now, _running)
                 s["archived"] = bool(s.get("archived"))
                 merged.append(s)
         except Exception as exc:
@@ -5195,13 +5190,11 @@ def get_profiles_sessions_sidebar(
     now = time.time()
 
     def _tag(rows: List[Dict[str, Any]], name: str) -> List[Dict[str, Any]]:
+        running = _running_session_ids(name)
         for s in rows:
             s["profile"] = name
             s["is_default_profile"] = name == "default"
-            s["is_active"] = (
-                s.get("ended_at") is None
-                and (now - s.get("last_active", s.get("started_at", 0))) < 300
-            )
+            s["is_active"] = _session_is_active(s, now, running)
             s["archived"] = bool(s.get("archived"))
         return rows
 
@@ -5295,6 +5288,7 @@ async def search_sessions(
             include_sources = [source_filter] if source_filter else (source_list or None)
             exclude_list = [s.strip() for s in (exclude_sources or "").split(",") if s.strip()]
             now = time.time()
+            running_ids = _running_session_ids(profile)
 
             # Walk parent_session_id to the compression root, memoized so a
             # chain of compression segments only costs one walk. We deliberately
@@ -5396,10 +5390,7 @@ async def search_sessions(
                             "started_at": row.get("started_at"),
                             "ended_at": row.get("ended_at"),
                             "last_active": row.get("last_active") or row.get("started_at"),
-                            "is_active": (
-                                row.get("ended_at") is None
-                                and (now - (row.get("last_active") or row.get("started_at") or 0)) < 300
-                            ),
+                            "is_active": _session_is_active(row, now, running_ids),
                             "message_count": row.get("message_count") or 0,
                             "tool_call_count": row.get("tool_call_count") or 0,
                             "input_tokens": row.get("input_tokens") or 0,
@@ -11898,6 +11889,102 @@ async def get_session_stats(profile: Optional[str] = None):
         db.close()
 
 
+# ── Session "working" state ───────────────────────────────────────────────
+# `is_active` on a session row used to mean "a message landed in the last 5
+# minutes". That is NOT the question the UI asks with it, which is "is the
+# agent working this session RIGHT NOW?". The two answers diverge in both
+# directions, and the gap is the whole turn:
+#
+#   * `last_active` is MAX(messages.timestamp), so a turn that spends minutes
+#     inside one model call or one slow tool writes no rows and the session
+#     goes dark in the list while it is demonstrably working.
+#   * A session that finished four minutes ago still reads as working.
+#
+# The gateway holds a turn lease per RESOLVED session_id for the whole
+# [load history -> run -> flush] region and now publishes the held ids into
+# `gateway_state.json`. That set is the authoritative answer, so read it.
+#
+# The 5-minute recency window is KEPT, as an OR, deliberately: an older
+# gateway, a stopped one, or an unreadable state file all yield an empty set
+# and every row then falls back to EXACTLY the previous behaviour. This can
+# restore a "working" marker that was wrongly missing; it can never remove
+# one that was there. Tightening it to authoritative-only (which would also
+# fix the four-minute afterglow) needs live confirmation that the published
+# ids match the ids REST lists, so it is deliberately not done blind here.
+
+_RUNNING_IDS_TTL = 2.0
+_running_ids_cache: Dict[str, Tuple[float, frozenset]] = {}
+
+
+def _running_session_ids(profile: Optional[str] = None) -> frozenset:
+    """Session ids the gateway reports as mid-turn. Empty when unknown.
+
+    Cached briefly because a single list request scores many rows (and the
+    multi-profile view reads several state files); the client polls every
+    ~10s, so a 2s TTL is far fresher than the consumer.
+
+    Fails open to an empty set on ANY problem — a status-file hiccup must
+    never change what the session list says, it just falls back to recency.
+    """
+    key = profile or ""
+    now = time.time()
+    hit = _running_ids_cache.get(key)
+    if hit is not None and (now - hit[0]) < _RUNNING_IDS_TTL:
+        return hit[1]
+    ids: frozenset = frozenset()
+    try:
+        if profile:
+            from hermes_cli import profiles as profiles_mod
+
+            profile_dir = profiles_mod.get_profile_dir(profile)
+            runtime = read_runtime_status(path=profile_dir / "gateway_state.json")
+            live_pid = get_runtime_status_running_pid(
+                runtime, expected_home=profile_dir
+            )
+        else:
+            runtime = read_runtime_status()
+            live_pid = get_runtime_status_running_pid(runtime)
+        # A dead gateway cannot be mid-turn. `active_session_ids` is only
+        # rewritten at turn boundaries, so it is NOT safe to age this out by
+        # file mtime (a long turn leaves the file untouched for exactly as
+        # long as the turn runs — the case this whole change exists for).
+        # Process liveness is the right guard; a restart republishes an empty
+        # set on its way to `running`.
+        if isinstance(runtime, dict) and live_pid:
+            raw = runtime.get("active_session_ids")
+            if isinstance(raw, (list, tuple, set, frozenset)):
+                ids = frozenset(str(x) for x in raw if x)
+    except Exception:
+        ids = frozenset()
+    _running_ids_cache[key] = (now, ids)
+    return ids
+
+
+def _session_is_active(
+    row: Dict[str, Any], now: float, running_ids: frozenset = frozenset()
+) -> bool:
+    """Whether a session row should read as working in a session list.
+
+    True when the gateway says a turn is in flight on it, OR (fallback) a
+    message landed within the recency window. An ended session is never
+    working, whichever signal fires.
+    """
+    if row.get("ended_at") is not None:
+        return False
+    if running_ids:
+        for key in ("id", "_lineage_root_id", "session_id"):
+            sid = row.get(key)
+            if sid and str(sid) in running_ids:
+                return True
+    last = row.get("last_active")
+    if last is None:
+        last = row.get("started_at") or 0
+    try:
+        return (now - float(last)) < 300
+    except (TypeError, ValueError):
+        return False
+
+
 def _open_session_db_for_profile(profile: Optional[str]):
     """Open a SessionDB for read paths, optionally for another profile.
 
@@ -12640,11 +12727,9 @@ def _list_cron_job_runs_sync(job_id: str, profile: Optional[str] = None, limit: 
     try:
         runs = db.list_cron_job_runs(canonical, limit=limit_n, offset=0)
         now = time.time()
+        _running = _running_session_ids(selected)
         for s in runs:
-            s["is_active"] = (
-                s.get("ended_at") is None
-                and (now - s.get("last_active", s.get("started_at", 0))) < 300
-            )
+            s["is_active"] = _session_is_active(s, now, _running)
             s["archived"] = bool(s.get("archived"))
             if selected:
                 s["profile"] = selected

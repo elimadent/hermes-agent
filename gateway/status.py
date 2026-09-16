@@ -979,6 +979,7 @@ def write_runtime_status(
     exit_reason: Any = _UNSET,
     restart_requested: Any = _UNSET,
     active_agents: Any = _UNSET,
+    active_session_ids: Any = _UNSET,
     platform: Any = _UNSET,
     platform_state: Any = _UNSET,
     error_code: Any = _UNSET,
@@ -1004,6 +1005,16 @@ def write_runtime_status(
         payload["restart_requested"] = bool(restart_requested)
     if active_agents is not _UNSET:
         payload["active_agents"] = parse_active_agents(active_agents)
+    if active_session_ids is not _UNSET:
+        # Resolved session ids with a turn IN FLIGHT (gateway turn leases).
+        # This is the authoritative "is the agent working this session?"
+        # signal; the dashboard/REST layer reads it so a long turn that
+        # writes no transcript rows for minutes still reads as working.
+        # De-duplicated and sorted so the file is stable across writes (a
+        # dict-order-only change must not churn the state file).
+        payload["active_session_ids"] = sorted(
+            {str(sid) for sid in (active_session_ids or []) if sid}
+        )
     if served_profiles is not _UNSET:
         # Profiles this gateway multiplexes (multi-profile mode). Absent/empty
         # for a single-profile gateway. Lets `hermes status` show per-profile

@@ -127,6 +127,24 @@ class SessionTurnLeaseRegistry:
     def __len__(self) -> int:
         return len(self._leases)
 
+    def held_session_ids(self) -> list[str]:
+        """Resolved session ids with a turn IN FLIGHT right now.
+
+        A lease is held for the whole ``[load history -> run -> flush]``
+        region, so "holder is not None" is the authoritative answer to "is
+        the agent working this session?" — unlike message recency, which
+        goes stale the moment a turn stops writing rows (a long model call,
+        a slow tool, deep reasoning) while the turn is very much alive.
+
+        After a mid-turn compression ``rebind`` the SAME lease object is
+        registered under both the old and the new id, so both are reported.
+        That over-reports by one row for the width of the rotation window and
+        is the honest direction: something really is running on that lineage.
+
+        Read-only and allocation-light — safe to call on every turn boundary.
+        """
+        return [sid for sid, lease in self._leases.items() if lease.holder is not None]
+
     def _get_or_create(self, session_id: str) -> _SessionLease:
         lease = self._leases.get(session_id)
         if lease is None:
