@@ -34,8 +34,53 @@ def run_git(cwd: str, *args: str) -> str:
     return bounded_git_probe(["git", "-C", cwd, *args], timeout=_GIT_TIMEOUT)
 
 
-def branch(cwd: str) -> str:
+def _probe_branch(cwd: str) -> str:
     return run_git(cwd, "branch", "--show-current") or run_git(cwd, "rev-parse", "--short", "HEAD")
+
+
+def _read_head(git_dir: str) -> bytes | None:
+    try:
+        with open(os.path.join(git_dir, "HEAD"), "rb") as fh:
+            return fh.read(512)
+    except OSError:
+        return None
+
+
+# cwd -> (HEAD file content, branch). HEAD holds either ``ref: refs/heads/<name>`` or a detached
+# sha, so its bytes change on every checkout, switch or detached commit and are an exact
+# freshness key: a hit costs one small file read instead of one or two ``git`` spawns.
+_branch_cache: dict[str, tuple[bytes, str]] = {}
+_branch_lock = threading.Lock()
+_BRANCH_CACHE_MAX = 1024
+
+
+def branch(cwd: str) -> str:
+    """Current branch name for ``cwd`` (short sha when detached, ``""`` outside a repo).
+
+    Session info builds (``session.activate`` and friends) ask for this on every call, so the
+    answer is cached per cwd and revalidated against the repo's ``HEAD`` file. The git dir
+    comes from the same single-flight root cache as :func:`repo_root` (positives for the
+    process, negatives for ``_NEG_TTL``), so a non-repo cwd costs no spawn either.
+    """
+    if not cwd or not os.path.isdir(cwd):
+        return ""
+    git_dir = _cache.resolve(f"gitdir:{cwd}", lambda: run_git(cwd, "rev-parse", "--absolute-git-dir"))
+    if not git_dir:
+        return ""
+    head = _read_head(git_dir)
+    if head is not None:
+        with _branch_lock:
+            hit = _branch_cache.get(cwd)
+        if hit is not None and hit[0] == head:
+            return hit[1]
+    value = _probe_branch(cwd)
+    # Store only when HEAD did not move during the probe, so a racing checkout is not pinned.
+    if value and head is not None and _read_head(git_dir) == head:
+        with _branch_lock:
+            if len(_branch_cache) >= _BRANCH_CACHE_MAX:
+                _branch_cache.clear()
+            _branch_cache[cwd] = (head, value)
+    return value
 
 
 class _RootCache:
@@ -89,8 +134,10 @@ _cache = _RootCache()
 
 
 def invalidate() -> None:
-    """Drop cached roots after a known mutation (e.g. a worktree was added)."""
+    """Drop cached roots and branches after a known mutation (e.g. a worktree was added)."""
     _cache.invalidate()
+    with _branch_lock:
+        _branch_cache.clear()
 
 
 def repo_root(cwd: str) -> str:
