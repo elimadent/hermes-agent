@@ -294,6 +294,9 @@ def _corrupt_profile_stores(targets) -> dict[str, str]:
 # Sidebar scan cache TTL: short enough that the UI never shows meaningfully stale data, long
 # enough to coalesce the desktop's reconnect/focus/change poll bursts into one scan.
 _SIDEBAR_CACHE_TTL_SECONDS = 5.0
+# How long a caller waits for an in-flight sidebar scan before answering from the last good
+# snapshot instead. Bounded on purpose: see _sidebar_singleflight_cache.
+_SIDEBAR_REFRESH_LOCK_WAIT_SECONDS = 3.0
 _SIDEBAR_CACHE_MAX_ENTRIES = 32
 _SIDEBAR_PROFILE_CACHE_MAX_ENTRIES = 256
 _SIDEBAR_PROFILE_CACHE = OrderedDict()
@@ -394,6 +397,9 @@ def _sidebar_singleflight_cache(func):
     cache_lock = threading.Lock()
     refresh_lock = threading.Lock()
     miss = object()
+    # Last successful snapshot per key with NO TTL. It only answers a caller that could not get
+    # the refresh lock in time, so it must outlive the TTL cache above.
+    last_good = OrderedDict()
 
     def _lookup(key):
         now = time.monotonic()
@@ -404,6 +410,11 @@ def _sidebar_singleflight_cache(func):
                 return miss
             cache.move_to_end(key)
             return copy.deepcopy(item[1])
+
+    def _lookup_last_good(key):
+        with cache_lock:
+            item = last_good.get(key)
+            return copy.deepcopy(item) if item is not None else miss
 
     @functools.wraps(func)
     def wrapped(*args, **kwargs):
@@ -419,8 +430,18 @@ def _sidebar_singleflight_cache(func):
             return cached
 
         # A plain Lock is intentional: FastAPI executes this sync handler in the AnyIO
-        # worker pool, so contenders sleep without holding the GIL.
-        with refresh_lock:
+        # worker pool, so contenders sleep without holding the GIL. The wait is bounded: an
+        # uncached scan opens every profile database and can run for a long time on a large
+        # store, and an unbounded acquire parked every contender in an AnyIO worker for all of
+        # it. Once the pool was used up, every other threadpool route stopped answering too.
+        if not refresh_lock.acquire(timeout=_SIDEBAR_REFRESH_LOCK_WAIT_SECONDS):
+            stale = _lookup_last_good(key)
+            if stale is not miss:
+                return stale
+            # Nothing cached for this key yet, and an empty answer would be wrong: run
+            # uncoalesced. A duplicate scan is recoverable, an exhausted pool is not.
+            return func(*args, **kwargs)
+        try:
             cached = _lookup(key)
             if cached is not miss:
                 return cached
@@ -440,7 +461,13 @@ def _sidebar_singleflight_cache(func):
                 cache.move_to_end(key)
                 while len(cache) > _SIDEBAR_CACHE_MAX_ENTRIES:
                     cache.popitem(last=False)
+                last_good[key] = snapshot
+                last_good.move_to_end(key)
+                while len(last_good) > _SIDEBAR_CACHE_MAX_ENTRIES:
+                    last_good.popitem(last=False)
             return result
+        finally:
+            refresh_lock.release()
 
     return wrapped
 

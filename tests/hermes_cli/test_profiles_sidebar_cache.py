@@ -54,6 +54,63 @@ class SidebarCacheTests(unittest.TestCase):
                 profiles._sidebar_profile_cache_put(key, {"index": index})
             self.assertEqual(len(profiles._SIDEBAR_PROFILE_CACHE), 2)
 
+    def _blocked_scan(self, payloads):
+        """A cached scan whose next call blocks until released; returns (scan, entered, release)."""
+        entered, release = threading.Event(), threading.Event()
+        calls = []
+
+        @profiles._sidebar_singleflight_cache
+        def scan(profile="all"):
+            calls.append(profile)
+            if len(calls) > 1:
+                entered.set()
+                release.wait(timeout=10)
+            return payloads[min(len(calls), len(payloads)) - 1]
+
+        return scan, entered, release, calls
+
+    def test_waiters_serve_last_good_instead_of_parking_behind_a_slow_scan(self):
+        scan, entered, release, calls = self._blocked_scan([{"rows": ["v1"]}, {"rows": ["v2"]}])
+        with mock.patch.object(profiles, "_SIDEBAR_REFRESH_LOCK_WAIT_SECONDS", 0.2), \
+                mock.patch.object(profiles, "_SIDEBAR_CACHE_TTL_SECONDS", 0.0001):
+            self.assertEqual(scan(), {"rows": ["v1"]})
+            time.sleep(0.01)  # the TTL entry has expired; only the last-good snapshot remains
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                slow = pool.submit(scan)
+                self.assertTrue(entered.wait(timeout=5))
+                started = time.monotonic()
+                waiter = scan()
+                waited = time.monotonic() - started
+                release.set()
+                self.assertEqual(slow.result(timeout=5), {"rows": ["v2"]})
+        self.assertEqual(waiter, {"rows": ["v1"]})
+        self.assertLess(waited, 2.0)
+        self.assertEqual(len(calls), 2)
+
+    def test_first_miss_with_no_snapshot_runs_uncoalesced_after_the_wait(self):
+        entered, release = threading.Event(), threading.Event()
+        calls = []
+
+        @profiles._sidebar_singleflight_cache
+        def scan(profile="all"):
+            calls.append(profile)
+            if len(calls) == 1:
+                entered.set()
+                release.wait(timeout=10)
+            return {"call": len(calls)}
+
+        with mock.patch.object(profiles, "_SIDEBAR_REFRESH_LOCK_WAIT_SECONDS", 0.2):
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                slow = pool.submit(scan)
+                self.assertTrue(entered.wait(timeout=5))
+                started = time.monotonic()
+                second = scan()
+                waited = time.monotonic() - started
+                release.set()
+                slow.result(timeout=5)
+        self.assertEqual(second, {"call": 2})
+        self.assertLess(waited, 2.0)
+
     def test_applies_defaults_and_returns_defensive_copies(self):
         calls = 0
 
