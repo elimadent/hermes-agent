@@ -1635,10 +1635,15 @@ def describe_invalid_response(agent: Any, response: Any, api_duration: float) ->
     if provider_name == "Unknown" and response and hasattr(response, 'model') and response.model:
         provider_name = f"model={response.model}"
 
-    if provider_name == "Unknown" and response:
-        resp_attrs = {k: str(v)[:100] for k, v in vars(response).items() if not k.startswith('_')}
-        if agent.verbose_logging:
-            logging.debug(f"Response attributes for invalid response: {resp_attrs}")
+    if provider_name == "Unknown" and response and getattr(agent, "verbose_logging", False):
+        # Not vars(): a provider client can hand back an object with no __dict__ (str, dict,
+        # coroutine, generator). vars() raised TypeError here, inside the invalid-response retry
+        # path, and the turn then failed as a non-retryable error on its first attempt.
+        attrs = getattr(response, "__dict__", None)
+        resp_attrs = ({k: str(v)[:100] for k, v in attrs.items() if not str(k).startswith('_')}
+                      if isinstance(attrs, dict) else {})
+        logging.debug("Response attributes for invalid response (type=%s): %s",
+                      type(response).__qualname__, resp_attrs)
 
     _resp_error_code = None
     if _has_error:
