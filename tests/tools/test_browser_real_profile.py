@@ -306,8 +306,9 @@ class TestRealProfileCdpLaunch:
              patch("hermes_cli.browser_connect.snapshot_real_profile", return_value=(str(tmp_path), None)), \
              patch("hermes_cli.browser_connect.chromium_executable", return_value="/usr/bin/chrome"), \
              patch.object(bt.subprocess, "Popen", side_effect=fake_popen), \
-             patch.object(bt_real_profile, "_agent_browser_get_cdp",
-                          side_effect=["http://127.0.0.1:5000", "http://127.0.0.1:41000"]), \
+             patch.object(bt_real_profile, "_probe_agent_browser_session",
+                          return_value=("http://127.0.0.1:5000", False)), \
+             patch.object(bt_real_profile, "_agent_browser_get_cdp", return_value="http://127.0.0.1:41000"), \
              patch.object(bt_real_profile, "_cdp_http_ready", return_value=True), \
              patch.object(bt_real_profile, "_cdp_on_data_dir", return_value=False), \
              patch.object(bt_real_profile, "_agent_browser_close_session",
@@ -319,6 +320,61 @@ class TestRealProfileCdpLaunch:
         assert closed["n"] == 1  # stale wrong-dir session was closed
         assert cdp == "http://127.0.0.1:41000"
         self._reset()
+
+    def test_poisoned_session_is_closed_before_relaunch(self, tmp_path):
+        """A session bound to a DEAD CDP port is closed, not mistaken for "no session".
+
+        ``get cdp-url`` on such a session exits non-zero with no ``ws://`` url. Read as plain
+        "no session", the close was skipped; agent-browser kept the name bound to the dead
+        endpoint and every later attach chased it (``All CDP discovery methods failed for
+        127.0.0.1:<old port>``) while the Chrome we had just launched sat on another port.
+        """
+        import subprocess as sp
+        import tools.browser_tool as bt
+        self._reset()
+        calls = []
+        gets = iter([sp.CompletedProcess([], 1, stdout="", stderr="connect ECONNREFUSED 127.0.0.1:9333"),
+                     sp.CompletedProcess([], 0, stdout="ws://127.0.0.1:41000/devtools/browser/x", stderr="")])
+
+        def fake_session_cmd(session_name, *cmd, log_label):
+            calls.append(cmd)
+            return next(gets) if cmd[0] == "get" else sp.CompletedProcess([], 0, stdout="", stderr="")
+
+        class FakeChrome:
+            def poll(self):
+                return None
+
+        def fake_popen(argv, **kw):
+            (tmp_path / "DevToolsActivePort").write_text("41000\n/devtools/browser/x\n")
+            return FakeChrome()
+
+        with patch.object(bt_cloud, "_use_real_profile", return_value=True), \
+             patch("hermes_cli.browser_connect.detect_default_chromium", return_value="chrome"), \
+             patch("hermes_cli.browser_connect.real_profile_copy_dir", return_value=str(tmp_path)), \
+             patch("hermes_cli.browser_connect.snapshot_real_profile", return_value=(str(tmp_path), None)), \
+             patch("hermes_cli.browser_connect.chromium_executable", return_value="/usr/bin/chrome"), \
+             patch.object(bt.subprocess, "Popen", side_effect=fake_popen), \
+             patch.object(bt_real_profile, "_agent_browser_session_cmd", side_effect=fake_session_cmd), \
+             patch.object(bt_real_profile, "_surviving_chrome_cdp", return_value=None), \
+             patch.object(bt_install, "_find_agent_browser", return_value="/usr/bin/agent-browser"), \
+             patch.object(bt_real_profile, "_capture_agent_browser_cli",
+                          return_value=Mock(returncode=0, stdout="", stderr="")), \
+             patch.object(bt, "_socket_safe_tmpdir", return_value=str(tmp_path)), \
+             patch.object(bt_cloud, "_is_headed_mode", return_value=False):
+            cdp, err = bt_real_profile._real_profile_cdp()
+        assert err is None
+        assert cdp == "http://127.0.0.1:41000"
+        assert ("close",) in calls, "a session bound to a dead CDP port must be closed before relaunch"
+        assert calls.index(("close",)) < len(calls) - 1  # closed before the post-launch probe
+        self._reset()
+
+    def test_missing_session_is_not_treated_as_poisoned(self):
+        import subprocess as sp
+        with patch.object(bt_real_profile, "_agent_browser_session_cmd",
+                          return_value=sp.CompletedProcess([], 0, stdout="", stderr="")):
+            assert bt_real_profile._probe_agent_browser_session("s") == (None, False)
+        with patch.object(bt_real_profile, "_agent_browser_session_cmd", return_value=None):
+            assert bt_real_profile._probe_agent_browser_session("s") == (None, False)
 
     @pytest.mark.parametrize("live_browser_id", ["/devtools/browser/x", "/devtools/browser/other"])
     def test_reattaches_to_surviving_chrome_instead_of_overlaying_its_profile(self, tmp_path, live_browser_id):
@@ -974,7 +1030,8 @@ class TestReviewRound3:
              patch.object(bt_lightpanda_fallback, "_using_lightpanda_engine", return_value=False), \
              patch("hermes_cli.browser_connect.detect_default_chromium", return_value="chrome"), \
              patch("hermes_cli.browser_connect.real_profile_copy_dir", return_value=str(tmp_path)), \
-             patch.object(bt_real_profile, "_agent_browser_get_cdp", return_value="http://127.0.0.1:9251"), \
+             patch.object(bt_real_profile, "_probe_agent_browser_session",
+                          return_value=("http://127.0.0.1:9251", False)), \
              patch.object(bt_real_profile, "_cdp_http_ready", return_value=True), \
              patch.object(bt_real_profile, "_cdp_on_data_dir", return_value=True), \
              patch("hermes_cli.browser_connect.snapshot_real_profile") as snap:

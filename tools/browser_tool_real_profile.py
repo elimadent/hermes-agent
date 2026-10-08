@@ -93,11 +93,25 @@ def _agent_browser_session_cmd(session_name: str, *cmd: str, log_label: str) -> 
         return None
 
 
+def _probe_agent_browser_session(session_name: str) -> tuple[Optional[str], bool]:
+    """``(http_cdp, poisoned)`` for an agent-browser session.
+
+    ``poisoned`` means ``get cdp-url`` FAILED (non-zero exit, no ``ws://`` url): the session name
+    is still bound to a CDP endpoint that no longer answers, e.g. a Chrome that died. agent-browser
+    keeps that endpoint under the session name and does not adopt a fresh ``--cdp`` for it, so the
+    session must be closed before any attach or every later command chases the dead port."""
+    proc = _agent_browser_session_cmd(session_name, "get", "cdp-url", log_label="get cdp-url")
+    if proc is None:
+        return None, False
+    m = re.search(r"ws://127\.0\.0\.1:(\d+)/", (proc.stdout or "").strip())
+    if m:
+        return f"http://127.0.0.1:{m.group(1)}", False
+    return None, proc.returncode != 0
+
+
 def _agent_browser_get_cdp(session_name: str) -> Optional[str]:
     """HTTP CDP discovery root of an agent-browser session (from its ``ws://`` cdp-url), or None."""
-    proc = _agent_browser_session_cmd(session_name, "get", "cdp-url", log_label="get cdp-url")
-    m = re.search(r"ws://127\.0\.0\.1:(\d+)/", (proc.stdout or "").strip()) if proc is not None else None
-    return f"http://127.0.0.1:{m.group(1)}" if m else None
+    return _probe_agent_browser_session(session_name)[0]
 
 
 def _read_devtools_port(data_dir: str) -> Optional[str]:
@@ -306,11 +320,13 @@ def _real_profile_cdp() -> tuple:
         # Cookies / Login Data) must NOT run while a live copy-browser (maybe from a previous
         # hermes process) holds the user-data-dir open — that corrupts the databases.
         copy_dir = real_profile_copy_dir(browser)
-        existing = _agent_browser_get_cdp(_bt._REAL_PROFILE_SESSION)
+        existing, poisoned = _probe_agent_browser_session(_bt._REAL_PROFILE_SESSION)
         if existing and _cdp_http_ready(existing) and _cdp_on_data_dir(existing, copy_dir):
             _bt._real_profile_cdp_cache["cdp"] = existing
             return existing, None
-        if existing:  # stale/wrong-dir session: close it so nothing holds the dir open
+        # Close a stale/wrong-dir session so nothing holds the dir open, and a poisoned one (bound
+        # to a dead CDP port) so the attach below is not hijacked by that dead endpoint.
+        if existing or poisoned:
             _agent_browser_close_session(_bt._REAL_PROFILE_SESSION)
         # A Chrome from an earlier hermes process can still hold the copy dir after its attach
         # daemon was reaped (that owner died). Re-attach to it rather than overlay a live profile;
