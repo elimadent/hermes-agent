@@ -523,12 +523,13 @@ def _filter_suspicious_mcp_servers(servers: dict[str, dict]) -> dict[str, dict]:
     return safe_servers
 
 
-def _portable_mcp_servers(safe_servers: dict[str, dict]) -> None:
-    """Merge plugin-provided (portable) MCP servers into *safe_servers*; native config wins on a clash. Never raises."""
+def _portable_mcp_servers(safe_servers: dict[str, dict], *, wait_for_plugins: bool = True) -> None:
+    """Merge plugin-provided (portable) MCP servers into *safe_servers*; native config wins on a clash.
+    ``wait_for_plugins=False`` serves the last complete plugin view while discovery runs on another
+    thread (see :func:`hermes_cli.plugins_mcp_snapshot.portable_mcp_snapshot`). Never raises."""
     try:
-        from hermes_cli.plugins import discover_plugins, get_plugin_manager
-        discover_plugins()
-        portable = get_plugin_manager().get_portable_mcp_servers()
+        from hermes_cli.plugins_mcp_snapshot import portable_mcp_snapshot
+        portable, _owners = portable_mcp_snapshot(wait=wait_for_plugins)
         for name, cfg in _filter_suspicious_mcp_servers(portable).items():
             if name in safe_servers:
                 logger.warning("Portable MCP server '%s' conflicts with native config; skipping", name)
@@ -538,8 +539,9 @@ def _portable_mcp_servers(safe_servers: dict[str, dict]) -> None:
         logger.debug("Failed to load portable MCP servers", exc_info=True)
 
 
-def _load_mcp_config() -> dict[str, dict]:
-    """``mcp_servers`` from config.yaml as ``{name: config}`` (empty on error / safe mode), ``${VAR}`` interpolated."""
+def _load_mcp_config(*, wait_for_plugins: bool = True) -> dict[str, dict]:
+    """``mcp_servers`` from config.yaml as ``{name: config}`` (empty on error / safe mode), ``${VAR}`` interpolated.
+    ``wait_for_plugins=False`` never waits on an in-flight plugin discovery (status reads)."""
     try:
         from hermes_cli.config import load_config
         from utils import env_var_enabled as _env_enabled
@@ -557,7 +559,7 @@ def _load_mcp_config() -> dict[str, dict]:
             if isinstance(interpolated, dict):
                 _warn_hidden_whitespace(name, interpolated)
                 safe_servers[name] = interpolated
-        _portable_mcp_servers(safe_servers)
+        _portable_mcp_servers(safe_servers, wait_for_plugins=wait_for_plugins)
         return safe_servers
     except Exception as exc:
         logger.debug("Failed to load MCP config: %s", exc)

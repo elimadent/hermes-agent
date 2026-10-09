@@ -113,9 +113,9 @@ def _mcp_rpc(name: str, required=_NAME):
     return _scoped_rpc(f"mcp.servers.{name}", required=required, catch_resolve=False)
 
 
-def _mcp_server_rows():
+def _mcp_server_rows(*, wait_for_plugins: bool = True):
     config_servers = _tools_mod("hermes_cli.mcp_config")._get_mcp_servers()
-    return _tools_mod("tui_gateway.mcp_rpc_helpers").server_configs_with_sources(config_servers)
+    return _tools_mod("tui_gateway.mcp_rpc_helpers").server_configs_with_sources(config_servers, wait_for_plugins=wait_for_plugins)
 
 
 def _mcp_named_server(rid, params):
@@ -1561,7 +1561,7 @@ def _(rid, params: dict) -> dict:
     scoped profile's; otherwise it is shown only when ``profile`` is the launch profile."""
     import time
     hc = _tools_mod("hermes_constants")
-    configured, plugins = _mcp_server_rows()
+    configured, plugins = _mcp_server_rows(wait_for_plugins=False)  # polled by the UI: never wait on a plugin sweep
     include_runtime = (_tools_mod("agent.secret_scope").is_multiplex_active()
                        or hc.hermes_home_key() == hc.hermes_home_key(hc.get_process_hermes_home()))
     safe = ("name", "transport", "tools", "connected", "disabled", "status")

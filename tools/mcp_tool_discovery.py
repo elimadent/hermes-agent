@@ -727,17 +727,22 @@ def is_mcp_tool_parallel_safe(tool_name: str) -> bool:
         return bool(server_name and _server_key(server_name) in _core._parallel_safe_servers)
 
 
-def get_mcp_status(configured: Optional[dict[str, dict]] = None, *, include_runtime: bool = True) -> list[dict]:
+def get_mcp_status(configured: Optional[dict[str, dict]] = None, *, include_runtime: bool = True,
+                   wait_for_plugins: bool = True) -> list[dict]:
     """Per-server status dicts for banner/TUI: name, transport, tools, connected, disabled,
     status (connected / disabled / connecting / failed / lazy / configured) and error for failed.
     Reads cached runtime state only; never connects.
 
     ``lazy`` is a registered-but-not-spawned server (``lazy: true``, tools from the schema
     cache): its tools are callable and the process starts on first use. Reporting it as
-    ``configured`` (never registered) misreads a working setup (#111717)."""
+    ``configured`` (never registered) misreads a working setup (#111717).
+
+    ``wait_for_plugins=False`` (UI status reads) never waits on a plugin discovery running on
+    another thread; plugin-provided servers then come from the last complete discovery."""
     if configured is None:
         with _owner_secret_scope():
-            configured = _config._load_mcp_config()
+            configured = (_config._load_mcp_config() if wait_for_plugins
+                          else _config._load_mcp_config(wait_for_plugins=False))
     else:
         configured = dict(configured)
     if not configured:

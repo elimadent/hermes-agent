@@ -9,17 +9,19 @@ from __future__ import annotations
 from typing import Any, Dict, Mapping
 
 
-def server_configs_with_sources(config_servers: Mapping[str, dict]) -> tuple[dict[str, dict], dict[str, str | None]]:
+def server_configs_with_sources(
+    config_servers: Mapping[str, dict], *, wait_for_plugins: bool = True,
+) -> tuple[dict[str, dict], dict[str, str | None]]:
+    """Configured plus plugin-provided servers, and the owning plugin of each (None = config).
+    ``wait_for_plugins=False`` serves the last complete plugin view while discovery runs elsewhere."""
     servers = {name: dict(cfg) for name, cfg in config_servers.items() if isinstance(cfg, dict)}
     plugins: dict[str, str | None] = {name: None for name in servers}
     try:
-        from hermes_cli.plugins import discover_plugins, get_plugin_manager
+        from hermes_cli.plugins_mcp_snapshot import portable_mcp_snapshot
         from tools.mcp_tool_config import _filter_suspicious_mcp_servers
 
-        discover_plugins()
-        manager = get_plugin_manager()
-        portable = _filter_suspicious_mcp_servers(manager.get_portable_mcp_servers())
-        owners = manager.get_portable_mcp_server_plugins()
+        portable, owners = portable_mcp_snapshot(wait=wait_for_plugins)
+        portable = _filter_suspicious_mcp_servers(portable)
         for name, cfg in portable.items():
             if name not in servers:
                 servers[name] = dict(cfg)

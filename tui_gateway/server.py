@@ -2434,7 +2434,7 @@ def _session_info(agent, session: dict | None = None) -> dict:
     info["mcp_servers"] = []
     with contextlib.suppress(Exception):
         from tools.mcp_tool_discovery import get_mcp_status
-        info["mcp_servers"] = get_mcp_status()
+        info["mcp_servers"] = get_mcp_status(wait_for_plugins=False)  # status read: never wait on a plugin sweep
     with contextlib.suppress(Exception):
         info["system_prompt"] = (
             mirror.get("system_prompt") if "system_prompt" in mirror else getattr(agent, "_cached_system_prompt", "") or "")
