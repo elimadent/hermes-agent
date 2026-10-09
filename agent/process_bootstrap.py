@@ -265,6 +265,83 @@ def close_shared_transports() -> int:
     return len(transports)
 
 
+# Connect-phase cap (seconds) for plain-HTTP, non-loopback local model hosts. 0 disables it.
+LOCAL_CONNECT_CAP_SECONDS = 5.0
+
+
+def _local_connect_cap_seconds(base_url: str) -> Optional[float]:
+    """Connect-phase cap (seconds) for a plain-HTTP, NON-loopback local endpoint (a LAN or
+    Tailscale model host), else None.
+
+    When such a host is powered off, the TCP handshake is never answered and the OS keeps
+    retrying it (about 21 s per attempt on Windows) before the request fails, so every turn and
+    every auxiliary call against a local model on a sleeping GPU box stalls before its fallback
+    runs. A live host accepts the TCP connection in milliseconds even while it is still loading a
+    model: load time is spent after connect, under the read budget, which this never touches.
+    Loopback is excluded (refused or accepted instantly either way) and so is https (httpcore
+    applies the connect timeout to the TLS handshake too).
+    """
+    import ipaddress
+    from urllib.parse import urlsplit
+
+    from agent.model_metadata import is_local_endpoint
+
+    cap = LOCAL_CONNECT_CAP_SECONDS
+    if not base_url or not cap or cap <= 0:
+        return None
+    try:
+        if urlsplit(str(base_url)).scheme.lower() != "http" or not is_local_endpoint(base_url):
+            return None
+    except ValueError:  # unparseable URL: leave the caller's timeout alone
+        return None
+    host = (base_url_hostname(base_url) or "").strip("[]").lower()
+    if not host or host == "localhost" or host.endswith(".localhost"):
+        return None
+    try:
+        if ipaddress.ip_address(host).is_loopback:
+            return None
+    except ValueError:  # a hostname, not an IP literal
+        pass
+    return float(cap)
+
+
+_ORIG_CONNECT_EXT = "hermes_uncapped_connect"
+
+
+def _apply_connect_cap(request) -> None:
+    """Request hook body: cap the CONNECT timeout when this request's URL is an eligible local
+    host, per request and per redirect hop. httpx copies extensions into redirect requests, so a
+    capped request redirected to an ineligible host gets the caller's original value back.
+    Read, write and pool timeouts are never changed."""
+    ext = request.extensions
+    current = dict(ext.get("timeout") or {})
+    cap = _local_connect_cap_seconds(str(request.url))
+    if cap:
+        connect = current.get("connect")
+        if connect is None or connect > cap:
+            new_ext = {**ext, "timeout": {**current, "connect": cap}}
+            if _ORIG_CONNECT_EXT not in ext:
+                new_ext[_ORIG_CONNECT_EXT] = connect
+            request.extensions = new_ext
+    elif _ORIG_CONNECT_EXT in ext:
+        restored = {k: v for k, v in ext.items() if k != _ORIG_CONNECT_EXT}
+        restored["timeout"] = {**current, "connect": ext[_ORIG_CONNECT_EXT]}
+        request.extensions = restored
+
+
+def _connect_cap_hooks(base_url: str, async_mode: bool) -> dict:
+    """``event_hooks`` for clients built for an eligible local endpoint (empty otherwise). Callers
+    pass per-request ``timeout=`` objects that override client defaults, so the cap is applied to
+    ``request.extensions["timeout"]`` after the request is built."""
+    if not _local_connect_cap_seconds(base_url):
+        return {}
+    if async_mode:
+        async def _acap(request) -> None:
+            _apply_connect_cap(request)
+        return {"event_hooks": {"request": [_acap]}}
+    return {"event_hooks": {"request": [_apply_connect_cap]}}
+
+
 def build_keepalive_http_client(base_url: str = "", *, async_mode: bool = False, verify: Any = True) -> Optional[Any]:
     """httpx client for OpenAI SDK calls with env-only proxy policy (None on failure).
 
@@ -318,8 +395,10 @@ def build_keepalive_http_client(base_url: str = "", *, async_mode: bool = False,
                 }
                 # Default transport = the https view; otherwise httpx builds a third, never-used
                 # direct transport (pool + SSL context) per client.
-                return client_cls(limits=limits, timeout=timeout, transport=mounts["https://"], mounts=mounts)
-        return client_cls(limits=limits, timeout=timeout, proxy=proxy, mounts=mounts or None, verify=verify)
+                return client_cls(limits=limits, timeout=timeout, transport=mounts["https://"], mounts=mounts,
+                                  **_connect_cap_hooks(base_url, async_mode))
+        hooks = _connect_cap_hooks(base_url, async_mode) if proxy is None else {}
+        return client_cls(limits=limits, timeout=timeout, proxy=proxy, mounts=mounts or None, verify=verify, **hooks)
     except Exception:
         return None
 
