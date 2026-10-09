@@ -12,15 +12,26 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from pathlib import Path
-from typing import Any, Dict, Iterator, Optional
+from typing import Any, Dict, Iterator, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
 # None = no scope bound (process-env behavior); dict = complete policy; Refusal = resolution failed.
 _terminal_scope_var: ContextVar = ContextVar("hermes_terminal_scope", default=None)
+
+# Cache the base policy (defaults + profile .env TERMINAL_* + config.yaml terminal:) by
+# (profile home, env mtime_ns, config mtime_ns). Overlay and cwd resolution stay per-call.
+_terminal_base_scope_cache: Dict[Tuple[str, int, int], Dict[str, str]] = {}
+_terminal_cache_lock = threading.Lock()
+
+
+def _reset_terminal_base_scope_cache() -> None:
+    with _terminal_cache_lock:
+        _terminal_base_scope_cache.clear()
 
 # Keys whose default lives in terminal_tool.py, not DEFAULT_CONFIG (which wins on overlap);
 # without them the projection is not total.
@@ -106,9 +117,18 @@ def build_profile_terminal_scope(
     from hermes_cli.config_defaults import DEFAULT_CONFIG
 
     home = Path(hermes_home)
-    scope: dict[str, str] = {}
+    env_path = home / ".env"
+    config_path = home / "config.yaml"
 
-    def _apply(mapping: dict[str, Any]) -> None:
+    def _mtime(path: Path) -> int:
+        try:
+            return path.stat().st_mtime_ns
+        except FileNotFoundError:
+            return -1
+        except Exception as exc:
+            raise TerminalPolicyUnavailable(f"cannot read {path}: {exc}") from exc
+
+    def _apply(target: dict[str, str], mapping: dict[str, Any]) -> None:
         for cfg_key, value in mapping.items():
             # cwd placeholders are resolved per-surface later; not a policy value.
             if value is None or (cfg_key == "cwd" and str(value).strip() in {".", "auto", "cwd"}):
@@ -118,27 +138,54 @@ def build_profile_terminal_scope(
                 # List/dict config values must be JSON (same contract as
                 # apply_terminal_config_to_env). str() yields Python repr, which
                 # json.loads in terminal_tool rejects.
-                scope[env_var] = _terminal_env_value(value)
+                target[env_var] = _terminal_env_value(value)
 
-    _apply({**_TOOL_LEVEL_DEFAULTS, **(DEFAULT_CONFIG.get("terminal") or {})})
-    default_image = scope.get("TERMINAL_DOCKER_IMAGE")
-    env_path = home / ".env"
-    if env_path.exists():
-        # load_env_file swallows OSError by design (secret scope fails soft); an unreadable
-        # profile .env must fail closed here.
+    def _load_yaml_terminal() -> dict[str, Any] | None:
+        if config_mtime == -1:
+            return None
+        from utils import load_yaml_file_readonly
+
         try:
-            env_path.read_bytes()
-        except Exception as exc:
-            raise TerminalPolicyUnavailable(f"cannot read {env_path}: {exc}") from exc
-        from agent.secret_scope import load_env_file
+            # Signature-cached: a scope is rebuilt per routed turn/poll, the file rarely changes.
+            raw = load_yaml_file_readonly(config_path)
+        except Exception as extra:
+            raise TerminalPolicyUnavailable(f"cannot parse {config_path}: {extra}") from extra
+        raw_terminal = raw.get("terminal") if isinstance(raw, dict) else None
+        return raw_terminal if isinstance(raw_terminal, dict) else None
 
-        profile_env = load_env_file(env_path)
-        scope.update((k, str(v)) for k, v in profile_env.items() if k.startswith("TERMINAL_"))
-        # Provenance, not value: an image WRITTEN in the profile's .env is the user's choice even when
-        # it spells the default (same rule apply_terminal_config_to_env applies to a set env var).
-        image_pinned = "TERMINAL_DOCKER_IMAGE" in profile_env
-    else:
-        image_pinned = False
+    env_mtime = _mtime(env_path)
+    config_mtime = _mtime(config_path)
+    cache_key = (str(home), env_mtime, config_mtime)
+    with _terminal_cache_lock:
+        cached = _terminal_base_scope_cache.get(cache_key)
+    if cached is None:
+        scope: dict[str, str] = {}
+        _apply(scope, {**_TOOL_LEVEL_DEFAULTS, **(DEFAULT_CONFIG.get("terminal") or {})})
+        if env_mtime != -1:
+            # load_env_file swallows OSError by design (secret scope fails soft); an unreadable
+            # profile .env must fail closed here.
+            try:
+                env_path.read_bytes()
+            except Exception as extra:
+                raise TerminalPolicyUnavailable(f"cannot read {env_path}: {extra}") from extra
+            from agent.secret_scope import load_env_file
+
+            profile_env = load_env_file(env_path)
+            scope.update((k, str(v)) for k, v in profile_env.items() if k.startswith("TERMINAL_"))
+            image_pinned = "TERMINAL_DOCKER_IMAGE" in profile_env
+        else:
+            image_pinned = False
+        raw_terminal = _load_yaml_terminal()
+        if raw_terminal:
+            _apply(scope, raw_terminal)
+            image_pinned = image_pinned or "docker_image" in raw_terminal
+        scope["TERMINAL_DOCKER_IMAGE_PINNED"] = "1" if image_pinned else "0"
+        with _terminal_cache_lock:
+            _terminal_base_scope_cache[cache_key] = dict(scope)
+            cached = _terminal_base_scope_cache[cache_key]
+    scope = dict(cached)
+    default_image = scope.get("TERMINAL_DOCKER_IMAGE")
+    image_pinned = scope.get("TERMINAL_DOCKER_IMAGE_PINNED") == "1"
     if env_overlay:
         scope.update((k, str(v)) for k, v in env_overlay.items()
                      if k.startswith("TERMINAL_") and k != "TERMINAL_DOCKER_IMAGE_PINNED")
@@ -147,26 +194,12 @@ def build_profile_terminal_scope(
         # value that differs from the default can prove a choice made there.
         if env_overlay.get("TERMINAL_DOCKER_IMAGE") not in (None, default_image):
             image_pinned = True
-    # Read config.yaml directly, not via read_raw_config() (which collapses "missing" and
-    # "unparseable" into {}): present-but-unparseable must fail closed.
-    config_path = home / "config.yaml"
-    try:
-        config_exists = config_path.exists()
-    except Exception as exc:
-        raise TerminalPolicyUnavailable(f"cannot resolve terminal config in {home}: {exc}") from exc
-    if config_exists:
-        from utils import load_yaml_file_readonly
-
-        try:
-            # Signature-cached: a scope is rebuilt per routed turn/poll, the file rarely changes.
-            raw = load_yaml_file_readonly(config_path)
-        except Exception as exc:
-            raise TerminalPolicyUnavailable(f"cannot parse {config_path}: {exc}") from exc
-        raw_terminal = raw.get("terminal") if isinstance(raw, dict) else None
-        if isinstance(raw_terminal, dict):
-            _apply(raw_terminal)
+        # YAML still wins over overlay, same order as the uncached path.
+        raw_terminal = _load_yaml_terminal()
+        if raw_terminal:
+            _apply(scope, raw_terminal)
             image_pinned = image_pinned or "docker_image" in raw_terminal
-    scope["TERMINAL_DOCKER_IMAGE_PINNED"] = "1" if image_pinned else "0"
+        scope["TERMINAL_DOCKER_IMAGE_PINNED"] = "1" if image_pinned else "0"
     _resolve_scope_cwd_placeholder(scope)
     return scope
 
