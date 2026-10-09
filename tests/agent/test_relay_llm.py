@@ -110,6 +110,40 @@ def test_sync_execution_uses_canonical_relay_operation_name(relay_turn, monkeypa
     assert observed_names == ["openai.chat_completions"]
 
 
+def test_sync_callback_returning_awaitable_is_awaited(relay_turn, monkeypatch):
+    """Relay runs the sync provider callback on its own event loop. A client that chooses sync or
+    async by "is a loop running?" then returns an un-awaited coroutine; the attempt must await it
+    (in the caller's context) instead of recording the coroutine object as the response."""
+    monkeypatch.setattr(relay_llm, "_codec", lambda *_args, **_kwargs: None)
+    marker = contextvars.ContextVar("relay_sync_await_marker", default=None)
+    marker.set("caller")
+    seen = {}
+
+    async def acreate():
+        seen["context"] = marker.get()
+        return {"content": "done"}
+
+    def callback(_request):
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return {"content": "done"}
+        seen["loop_running"] = True
+        return acreate()
+
+    result = relay_llm.execute(
+        {"model": "test-model", "messages": []},
+        callback,
+        session_id="session-1",
+        name="custom",
+        model_name="test-model",
+        metadata={"api_mode": "chat_completions"},
+    )
+
+    assert result == {"content": "done"}
+    assert seen == {"loop_running": True, "context": "caller"}
+
+
 @pytest.mark.asyncio
 async def test_async_execution_uses_canonical_relay_operation_name(
     relay_turn, monkeypatch

@@ -128,6 +128,10 @@ class _ManagedAttempt:
         """Provider callback handed to Relay: run ``callback`` on Relay's (possibly rewritten) request."""
         with self._recording_errors():
             raw = self.run_callback(callback, self.provider_request(next_request))
+            # Relay drives this sync callback on its own event loop, so a client that picks sync vs
+            # async by "is a loop running?" hands back an un-awaited coroutine. Resolve it here.
+            if inspect.isawaitable(raw):
+                raw = _resolve_awaitable_off_loop(raw)
         return self._record(raw)
 
     async def invoke_async(self, callback: Callable[..., Any], next_request: Any) -> Any:
@@ -952,6 +956,21 @@ def _json_equal(left: Any, right: Any) -> bool:
         return _canonical_json(left) == _canonical_json(right)
     except (TypeError, ValueError):
         return False
+
+
+def _resolve_awaitable_off_loop(value: Any) -> Any:
+    """Await ``value`` from synchronous code that may itself be running on an event-loop thread:
+    run it to completion on a private loop in a helper thread, carrying the caller's context."""
+    async def _await() -> Any:
+        return await value
+
+    if not _has_running_event_loop():
+        return asyncio.run(_await())
+    import concurrent.futures
+
+    context = contextvars.copy_context()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="relay-await") as pool:
+        return pool.submit(context.run, asyncio.run, _await()).result()
 
 
 def _run_awaitable(
